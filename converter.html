@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Processing JPG to GBA Header...</h1>
+<img id="img" src="Rocket_League_coverart.jpg" style="display:none;" onload="process()">
+<textarea id="output" style="width:100%; height: 500px;"></textarea>
+<script>
+function process() {
+    let img = document.getElementById('img');
+    let canvas = document.createElement('canvas');
+    canvas.width = 240;
+    canvas.height = 160;
+    let ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 240, 160);
+    let data = ctx.getImageData(0, 0, 240, 160).data;
+    
+    // 6-6-6 palette (216 colors)
+    let palette = [];
+    for(let r=0; r<6; r++) {
+        for(let g=0; g<6; g++) {
+            for(let b=0; b<6; b++) {
+                palette.push({r: Math.min(255, r*51), g: Math.min(255, g*51), b: Math.min(255, b*51)});
+            }
+        }
+    }
+    while(palette.length < 256) palette.push({r:0, g:0, b:0});
+    
+    let out = "const unsigned short title_pal[256] = {\\n";
+    for(let i=0; i<256; i++) {
+        let r = palette[i].r >> 3;
+        let g = palette[i].g >> 3;
+        let b = palette[i].b >> 3;
+        let rgb5 = r | (g << 5) | (b << 10);
+        out += "0x" + rgb5.toString(16).padStart(4, '0') + ", ";
+        if ((i+1) % 8 === 0) out += "\\n";
+    }
+    out += "};\\n\\n";
+    
+    out += "const unsigned char title_bitmap[38400] = {\\n";
+    for(let i=0; i<38400; i++) {
+        let r = data[i*4];
+        let g = data[i*4+1];
+        let b = data[i*4+2];
+        let best_dist = 9999999;
+        let best_idx = 0;
+        for(let p=0; p<216; p++) {
+            let dr = r - palette[p].r;
+            let dg = g - palette[p].g;
+            let db = b - palette[p].b;
+            let dist = dr*dr + dg*dg + db*db;
+            if(dist < best_dist) {
+                best_dist = dist;
+                best_idx = p;
+            }
+        }
+        out += best_idx + ",";
+        if ((i+1) % 30 === 0) out += "\\n";
+    }
+    out += "\\n};\\n";
+    
+    document.getElementById('output').value = out;
+}
+</script>
+</body>
+</html>

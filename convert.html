@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head><title>Convert</title></head>
+<body>
+    <img id="srcimg" src="Rocket_League_coverart.jpg" style="display:none;" />
+    <div id="status">Loading...</div>
+    <script>
+        const baseColors = [
+            [31, 31, 31], [31, 0, 0], [0, 31, 0], [0, 10, 31],
+            [31, 31, 0], [0, 31, 31], [31, 16, 0], [25, 0, 25]
+        ];
+        
+        const palette = [];
+        for (let c = 0; c < 8; c++) {
+            for (let s = 0; s < 16; s++) {
+                let r = Math.floor(baseColors[c][0] * s / 15);
+                let g = Math.floor(baseColors[c][1] * s / 15);
+                let b = Math.floor(baseColors[c][2] * s / 15);
+                palette.push([ Math.floor(r*255/31), Math.floor(g*255/31), Math.floor(b*255/31) ]);
+            }
+        }
+        
+        const sysColors = [
+            [1,1,5], [0,31,16], [31,31,31], [31,24,0], [0,0,0],
+            [0,26,12], [4,22,4], [6,28,6], [8,18,2], [31,31,0]
+        ];
+        for (let c of sysColors) {
+            palette.push([ Math.floor(c[0]*255/31), Math.floor(c[1]*255/31), Math.floor(c[2]*255/31) ]);
+        }
+        
+        // Fill rest with black up to 256
+        while(palette.length < 256) palette.push([0,0,0]);
+
+        function getClosestColor(r, g, b) {
+            let minD = Infinity;
+            let idx = 0;
+            for(let i=0; i<256; i++) {
+                let dr = r - palette[i][0];
+                let dg = g - palette[i][1];
+                let db = b - palette[i][2];
+                let d = dr*dr + dg*dg + db*db;
+                if(d < minD) {
+                    minD = d;
+                    idx = i;
+                }
+            }
+            return idx;
+        }
+
+        window.onload = function() {
+            let img = document.getElementById("srcimg");
+            
+            // Wait for image to be fully loaded
+            if (img.complete && img.naturalHeight !== 0) {
+                processImage(img);
+            } else {
+                img.onload = () => processImage(img);
+                img.onerror = () => { document.getElementById("status").innerText = "Image load error"; };
+            }
+        };
+
+        function processImage(img) {
+            document.getElementById("status").innerText = "Processing...";
+            let canvas = document.createElement("canvas");
+            canvas.width = 240;
+            canvas.height = 160;
+            let ctx = canvas.getContext("2d");
+            
+            // Draw resized
+            ctx.drawImage(img, 0, 0, 240, 160);
+            
+            let imgData = ctx.getImageData(0, 0, 240, 160);
+            let data = imgData.data;
+            
+            // Floyd-Steinberg dithering
+            let width = 240;
+            let height = 160;
+            let outIndices = [];
+            
+            // Work with floats for dithering
+            let pixels = new Float32Array(width * height * 3);
+            for(let i=0; i<width*height; i++) {
+                pixels[i*3] = data[i*4];
+                pixels[i*3+1] = data[i*4+1];
+                pixels[i*3+2] = data[i*4+2];
+            }
+            
+            for(let y=0; y<height; y++) {
+                for(let x=0; x<width; x++) {
+                    let i = (y*width + x) * 3;
+                    let r = pixels[i];
+                    let g = pixels[i+1];
+                    let b = pixels[i+2];
+                    
+                    let palIdx = getClosestColor(r, g, b);
+                    outIndices.push(palIdx);
+                    
+                    let nr = palette[palIdx][0];
+                    let ng = palette[palIdx][1];
+                    let nb = palette[palIdx][2];
+                    
+                    let errR = r - nr;
+                    let errG = g - ng;
+                    let errB = b - nb;
+                    
+                    let distribute = (dx, dy, factor) => {
+                        if(x+dx >= 0 && x+dx < width && y+dy < height) {
+                            let ni = ((y+dy)*width + (x+dx)) * 3;
+                            pixels[ni] += errR * factor;
+                            pixels[ni+1] += errG * factor;
+                            pixels[ni+2] += errB * factor;
+                        }
+                    };
+                    
+                    distribute(1, 0, 7/16);
+                    distribute(-1, 1, 3/16);
+                    distribute(0, 1, 5/16);
+                    distribute(1, 1, 1/16);
+                }
+            }
+            
+            let c_code = "#ifndef COVERART_H\n#define COVERART_H\n\n#include <tonc.h>\n\nconst u8 coverart_data[38400] __attribute__((aligned(4))) = {\n";
+            for(let i=0; i<outIndices.length; i+=16) {
+                let chunk = outIndices.slice(i, i+16);
+                c_code += "    " + chunk.map(x => "0x" + x.toString(16).padStart(2, '0')).join(", ") + ",\n";
+            }
+            c_code += "};\n\n#endif\n";
+            
+            document.getElementById("status").innerText = "Saving...";
+            
+            fetch("/save", {
+                method: "POST",
+                body: c_code
+            }).then(res => {
+                document.getElementById("status").innerText = "DONE";
+            }).catch(e => {
+                document.getElementById("status").innerText = "ERROR: " + e;
+            });
+        }
+    </script>
+</body>
+</html>
