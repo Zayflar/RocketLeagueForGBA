@@ -265,6 +265,39 @@ Mesh sphere_mesh = {
     sphere_faces
 };
 
+/* The first twelve icosphere vertices form a compact distant-ball silhouette. */
+static const Face far_ball_faces[20] = {
+    { 0, 11, 5, 130 },
+    { 0, 5, 1, 130 },
+    { 0, 1, 7, 130 },
+    { 0, 7, 10, 130 },
+    { 0, 10, 11, 130 },
+    { 1, 5, 9, 130 },
+    { 5, 11, 4, 130 },
+    { 11, 10, 2, 130 },
+    { 10, 7, 6, 130 },
+    { 7, 1, 8, 130 },
+    { 3, 9, 4, 130 },
+    { 3, 4, 2, 130 },
+    { 3, 2, 6, 130 },
+    { 3, 6, 8, 130 },
+    { 3, 8, 9, 130 },
+    { 4, 9, 5, 130 },
+    { 2, 4, 11, 130 },
+    { 6, 2, 10, 130 },
+    { 8, 6, 7, 130 },
+    { 9, 8, 1, 130 },
+};
+static Vector3 far_ball_normals[20] EWRAM_MODEL_DATA;
+static Mesh far_ball_mesh = {"DISTANT_BALL",12,20,sphere_verts,far_ball_faces,far_ball_normals};
+
+const Mesh *car_gameplay_mesh(int model, int distance_sq) {
+    return distance_sq > 240*240 ? car_far_models[model] : car_match_models[model];
+}
+const Mesh *ball_gameplay_mesh(int distance_sq) {
+    return distance_sq > 260*260 ? &far_ball_mesh : &sphere_mesh;
+}
+
 void init_dynamic_models(void) {
     /* ----------------------------------------------------
        Torus Generator
@@ -497,6 +530,12 @@ void init_mesh_normals(void) {
     compute_normals(car_vertices, car_faces, car_mesh.face_count, car_normals);
     compute_normals(opp_car_vertices, opp_car_faces, opp_car_mesh.face_count, opp_car_normals);
     compute_normals(rover_vertices, rover_faces, rover_mesh.face_count, rover_normals);
+    for (int model=0;model<CAR_MODEL_COUNT;model++) {
+        const Mesh *near=car_match_models[model], *far=car_far_models[model];
+        compute_normals(near->vertices,near->faces,near->face_count,(Vector3 *)near->face_normals);
+        compute_normals(far->vertices,far->faces,far->face_count,(Vector3 *)far->face_normals);
+    }
+    compute_normals(sphere_verts,far_ball_faces,20,far_ball_normals);
     compute_normals(sphere_verts,      sphere_faces,   SPHERE_FCOUNT, sphere_normals);
     compute_normals(puck_vertices,     puck_faces,     24,            puck_normals);
     compute_normals(goal_vertices,     goal_faces,     10,            goal_normals);
@@ -506,4 +545,37 @@ void init_mesh_normals(void) {
     sphere_mesh.face_normals   = sphere_normals;
     puck_mesh.face_normals     = puck_normals;
     goal_mesh.face_normals     = goal_normals;
+}
+
+/* Cached once from actual mesh bounds, including wheels and bodywork. */
+static Vector3 car_centers[CAR_MODEL_COUNT];
+static int car_centers_ready;
+
+Vector3 car_render_position(int model, Vector3 pos, int yaw, const int32_t rotation[9]) {
+    if (!car_centers_ready) {
+        for (int m = 0; m < CAR_MODEL_COUNT; ++m) {
+            const Mesh *mesh = car_models[m];
+            Vector3 lo = mesh->vertices[0], hi = lo;
+            for (int i = 1; i < mesh->vertex_count; ++i) {
+                Vector3 v = mesh->vertices[i];
+                if (v.x < lo.x) lo.x = v.x;
+                if (v.y < lo.y) lo.y = v.y;
+                if (v.z < lo.z) lo.z = v.z;
+                if (v.x > hi.x) hi.x = v.x;
+                if (v.y > hi.y) hi.y = v.y;
+                if (v.z > hi.z) hi.z = v.z;
+            }
+            car_centers[m] = (Vector3){(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+        }
+        car_centers_ready = 1;
+    }
+    Vector3 c = car_centers[model];
+    int32_t sy = custom_sin_lut[yaw & 255], cy = custom_cos_lut[yaw & 255];
+    /* Translation = ground origin + yaw * center - rotation * center. */
+    pos.x += ((cy * c.x + sy * c.z) >> 12) -
+             ((rotation[0] * c.x + rotation[1] * c.y + rotation[2] * c.z) >> 12);
+    pos.y += c.y - ((rotation[3] * c.x + rotation[4] * c.y + rotation[5] * c.z) >> 12);
+    pos.z += ((-sy * c.x + cy * c.z) >> 12) -
+             ((rotation[6] * c.x + rotation[7] * c.y + rotation[8] * c.z) >> 12);
+    return pos;
 }

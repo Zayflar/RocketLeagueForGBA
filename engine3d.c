@@ -9,6 +9,13 @@
 /* --- Shared EWRAM Frame Buffer --- */
 u8 frame_buffer[240 * 160] __attribute__((section(".ewram"), aligned(4)));
 
+/* Rendering is synchronous and non-reentrant. Share scratch storage instead
+ * of putting 5-6 KB of vertex arrays on the small IWRAM user stack per draw. */
+static Vector3 model_vertices[256] __attribute__((section(".ewram"), aligned(4)));
+static int screen_x[256] __attribute__((section(".ewram"), aligned(4)));
+static int screen_y[256] __attribute__((section(".ewram"), aligned(4)));
+static int z_proj[256] __attribute__((section(".ewram"), aligned(4)));
+
 /* --- Look-Up Tables --- */
 fixed custom_div_lut[2048] __attribute__((section(".ewram"), aligned(4)));
 int32_t custom_sin_lut[256] __attribute__((aligned(4)));
@@ -51,8 +58,11 @@ static void init_car_texture(void) {
             if ((x == 4 || x == 11) && y > 24 && y < 29) c = 10;
             break;
         case 4: /* Glass with a broad reflection and painted surround. */
-            if (x > 1 && x < 14 && y > 3 && y < 28)
-                c = (y < 10 + x / 2) ? 55 : 50;
+            if (x > 1 && x < 14 && y > 3 && y < 28) {
+                int reflection = 10 + x / 2;
+                c = y < reflection - 2 ? 57 : (y <= reflection ? 86 : 51);
+                if (x == 2 || y == 27) c = 7;
+            }
             break;
         case 5: { /* Tyre and five-spoke-style silver hub. */
             int dx = (x - 8) * 2, dy = y - 16;
@@ -71,60 +81,12 @@ static void init_car_texture(void) {
 }
 
 void init_pitch_texture(void) {
-    /* The floor sampler stores one mirrored quadrant at two world units per
-       texel.  These dimensions match the actual collision field and the
-       projected overlay in main.c. */
-    enum {
-        PITCH_EDGE_X = 153,
-        PITCH_EDGE_Z = 229,
-        EDGE_LINE_WIDTH = 3,
-        LINE_HALF_WIDTH = 1,
-        CENTRE_RADIUS = 18,
-        PENALTY_HALF_WIDTH = 75,
-        PENALTY_DEPTH = 25,
-        GOAL_HALF_WIDTH = 55,
-        GOAL_DEPTH = 12
-    };
-
-    for (int z = 0; z < 512; z++) {
-        for (int x = 0; x < 256; x++) {
-            /* Broad alternating mowing bands keep the surface calm behind the
-               markings instead of producing a noisy checkerboard. */
-            u8 tex = ((z / 24) & 1) ? 1 : 0;
-            int r2 = x*x + z*z;
-
-            /* Continuous touchlines and goal lines, three texels wide. */
-            if (x >= PITCH_EDGE_X - EDGE_LINE_WIDTH + 1 &&
-                x <= PITCH_EDGE_X && z <= PITCH_EDGE_Z) tex = 2;
-            if (z >= PITCH_EDGE_Z - EDGE_LINE_WIDTH + 1 &&
-                z <= PITCH_EDGE_Z && x <= PITCH_EDGE_X) tex = 2;
-
-            /* Halfway line, centre circle, and a small filled kickoff mark. */
-            if (z <= LINE_HALF_WIDTH && x <= PITCH_EDGE_X) tex = 2;
-            if (r2 >= (CENTRE_RADIUS - LINE_HALF_WIDTH) *
-                      (CENTRE_RADIUS - LINE_HALF_WIDTH) &&
-                r2 <= (CENTRE_RADIUS + LINE_HALF_WIDTH) *
-                      (CENTRE_RADIUS + LINE_HALF_WIDTH)) tex = 2;
-            if (r2 <= 2 * 2) tex = 2;
-
-            /* Full penalty areas aligned with the widened goals. */
-            if (x <= PENALTY_HALF_WIDTH + LINE_HALF_WIDTH &&
-                z >= PITCH_EDGE_Z - PENALTY_DEPTH - LINE_HALF_WIDTH &&
-                z <= PITCH_EDGE_Z) {
-                if (x >= PENALTY_HALF_WIDTH - LINE_HALF_WIDTH ||
-                    z <= PITCH_EDGE_Z - PENALTY_DEPTH + LINE_HALF_WIDTH) tex = 2;
-            }
-
-            /* Smaller six-yard/goal area inside each penalty area. */
-            if (x <= GOAL_HALF_WIDTH + LINE_HALF_WIDTH &&
-                z >= PITCH_EDGE_Z - GOAL_DEPTH - LINE_HALF_WIDTH &&
-                z <= PITCH_EDGE_Z) {
-                if (x >= GOAL_HALF_WIDTH - LINE_HALF_WIDTH ||
-                    z <= PITCH_EDGE_Z - GOAL_DEPTH + LINE_HALF_WIDTH) tex = 2;
-            }
-
-            pitch_texture[z][x] = tex;
-        }
+    /* Only mowing bands belong in the low-cost floor sampler. Pitch markings
+       use the clipped world-space pass, so camera tilt cannot produce a second,
+       offset circle or doubled boundary lines. */
+    for (int z=0;z<512;z++) {
+        u8 stripe=(z/24)&1;
+        memset(pitch_texture[z],stripe,256);
     }
 }
 
@@ -238,17 +200,17 @@ void init_3d_engine(void) {
     pal_bg_mem[131] = RGB5(31, 24, 0);  // HUD highlight (gold)
     pal_bg_mem[132] = RGB5(0, 0, 0);    // Outlines (pure black)
     pal_bg_mem[133] = RGB5(0, 26, 12);  // Grid line color (bright teal/green)
-    pal_bg_mem[134] = RGB5(3, 18, 3);   // Grass dark (far)
-    pal_bg_mem[135] = RGB5(5, 24, 5);   // Grass light (near stripe)
-    pal_bg_mem[136] = RGB5(4, 20, 4);   // Grass mid (medium distance)
+    pal_bg_mem[134] = RGB5(3, 19, 5);   // Grass dark (far)
+    pal_bg_mem[135] = RGB5(4, 25, 6);   // Grass light (near stripe)
+    pal_bg_mem[136] = RGB5(3, 22, 5);   // Grass mid (medium distance)
     pal_bg_mem[137] = RGB5(31, 31, 0);  // Centre circle / lines (bright yellow)
     // Extra sky gradient bands (used by draw_environment_background)
     pal_bg_mem[138] = RGB5(5, 12, 26);  // Sky top (same as 128)
     pal_bg_mem[139] = RGB5(9, 18, 28);  // Sky mid-high
     pal_bg_mem[140] = RGB5(16, 22, 29); // Sky mid-low (near horizon)
     pal_bg_mem[141] = RGB5(22, 26, 30); // Horizon haze (brightest)
-    pal_bg_mem[142] = RGB5(6, 20, 5);   // Grass light near (bright)
-    pal_bg_mem[143] = RGB5(3, 16, 3);   // Grass very far (darkest)
+    pal_bg_mem[142] = RGB5(6, 28, 7);   // Grass light near (bright)
+    pal_bg_mem[143] = RGB5(3, 17, 5);   // Grass very far (darkest)
     /* Menu UI: dark glass panels and their cool-blue highlight. */
     pal_bg_mem[144] = RGB5(1, 4, 11);
     pal_bg_mem[145] = RGB5(3, 9, 20);
@@ -268,6 +230,25 @@ void init_3d_engine(void) {
     pal_bg_mem[155] = RGB5(27, 28, 30);
     pal_bg_mem[156] = RGB5(30, 30, 31);
     pal_bg_mem[157] = RGB5(31, 31, 31);
+
+    /* Soft surface-colored shadows avoid black cutouts on grass and ice. */
+    pal_bg_mem[SHADOW_GRASS_EDGE] = RGB5(5, 16, 8);
+    pal_bg_mem[SHADOW_GRASS_CORE] = RGB5(4, 12, 7);
+    pal_bg_mem[SHADOW_ICE_EDGE] = RGB5(24, 27, 29);
+    pal_bg_mem[SHADOW_ICE_CORE] = RGB5(18, 22, 25);
+    pal_bg_mem[STAND_DARK] = RGB5(4, 7, 11);
+    pal_bg_mem[STAND_LIGHT] = RGB5(6, 10, 14);
+    pal_bg_mem[STAND_RAIL] = RGB5(13, 19, 23);
+    pal_bg_mem[CROWD_BLUE] = RGB5(8, 18, 29);
+    pal_bg_mem[CROWD_ORANGE] = RGB5(28, 16, 7);
+    pal_bg_mem[CROWD_NEUTRAL] = RGB5(22, 24, 23);
+    pal_bg_mem[WALL_HEX] = RGB5(12, 22, 23);
+    pal_bg_mem[ICE_SURFACE_STRIPE] = RGB5(26, 29, 30);
+    for (int i = 0; i < SKY_GRADIENT_COUNT; ++i) {
+        pal_bg_mem[SKY_GRADIENT_START + i] = RGB5(
+            5 + (17 * i + 7) / 15, 12 + (14 * i + 7) / 15,
+            26 + (4 * i + 7) / 15);
+    }
 
     // Pre-calculate Division LUT (1 / i) in 16.16 fixed point
     custom_div_lut[0] = 0;
@@ -309,6 +290,45 @@ void init_3d_engine(void) {
     REG_BG2Y = 0;
 }
 
+/* Soccer stripes are uniform runs, not a two-dimensional texture lookup.
+ * Split exactly at mirrored 48-world-unit boundaries; never alter markings. */
+static void draw_grass_span(u8 *dst, int count, fixed z, fixed step, const u8 colors[4]) {
+    const int band=24*512;
+    while(count>0) {
+        int absolute=z<0?-z:z;
+        int stripe=absolute/band;
+        int run=count;
+        if(step) {
+            int gap;
+            int speed=step<0?-step:step;
+            if(step>0) gap=z>=0?(stripe+1)*band-z:-stripe*band+1-z;
+            else gap=z<=0?z+(stripe+1)*band:z-stripe*band+1;
+            run=(gap+speed-1)/speed;
+            if(run<1)run=1;
+            if(run>count)run=count;
+        }
+        fast_span_fill(dst,(u32)colors[stripe&1]*0x01010101u,run);
+        dst+=run;count-=run;z+=step*run;
+    }
+}
+
+/* Share one reciprocal between X/Y, then correct truncation exactly.
+ * The usual coordinates need no fallback and retain integer-division pixels. */
+static inline int project_quotient(int numerator, int depth, int reciprocal) {
+    if(numerator <= -1073741824 || numerator >= 1073741824 || depth>1073741824)
+        return numerator/depth;
+    int value=(int)(((int64_t)numerator*reciprocal)/1073741824LL);
+    int remainder=numerator-value*depth;
+    if(remainder>=depth) ++value;
+    else if(remainder<=-depth) --value;
+    return value;
+}
+static IWRAM_CODE __attribute__((noinline)) void project_camera_point(fixed x, fixed y, fixed z, int *sx, int *sy) {
+    int reciprocal=1073741824/z;
+    *sx=project_quotient(x*120,z,reciprocal)+120/RENDER_SCALE;
+    *sy=project_quotient(-y*120,z,reciprocal)+80/RENDER_SCALE;
+}
+
 /* --- Buffer Management --- */
 /* --- clear_screen moved to render.c --- */
 
@@ -330,7 +350,7 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
 
     int out_start_y = aligned_start_y / RENDER_SCALE;
 
-    // Sky gradient: 4 bands from top to horizon
+    // Sixteen sky shades blend smoothly into the existing horizon haze
     // For hockey use white/light palette, for soccer use graduated blue sky.
     int is_hockey = (sky_color == 14);
     if (out_start_y > 0) {
@@ -340,10 +360,8 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
             if (is_hockey) {
                 band = sky_color; /* flat white for hockey arena */
             } else {
-                /* Blue sky gradient: top=138 (deep), bottom near horizon=141 (haze) */
-                int t = (y * 4) / (sky_rows > 1 ? sky_rows : 1); /* 0..3 */
-                band = 138 + t;
-                if (band > 141) band = 141;
+                int t = (y * (SKY_GRADIENT_COUNT - 1)) / (sky_rows > 1 ? sky_rows - 1 : 1);
+                band = SKY_GRADIENT_START + t;
             }
             u32 w = (u32)band | ((u32)band<<8) | ((u32)band<<16) | ((u32)band<<24);
             memset32(&frame_buffer[y * 240], w, RENDER_WIDTH / 4);
@@ -360,7 +378,7 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
     fixed cam_h = camera_pos.y;
     if (cam_h <= 0) cam_h = FP_ONE;
 
-    u32 fog_word = (141 << 24) | (141 << 16) | (141 << 8) | 141;
+    u32 fog_word = (is_hockey ? 14u : 141u) * 0x01010101u;
     int y_step = (RENDER_SCALE == 1) ? 2 : 1;
 
     for (int y_out = out_start_y; y_out < RENDER_HEIGHT; y_out += y_step) {
@@ -402,20 +420,20 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
         if (active_pitch_mode == 1) {
             /* Hockey ice palette */
             palette_map[0] = 14;  /* white ice */
-            palette_map[1] = 83;  /* light blue ice stripe (5*16+3) */
-            palette_map[2] = 16;  /* red line (1*16+0) */
-            palette_map[3] = 48;  /* blue line (3*16+0) */
+            palette_map[1] = ICE_SURFACE_STRIPE; /* pale blue, not the near-black cyan ramp */
+            palette_map[2] = 28;  /* visible red markings */
+            palette_map[3] = 60;  /* visible blue markings */
         } else if (distance > 200 * FP_SCALE) {
             /* Very far: darkest grass, muted lines (blends into fog) */
             palette_map[0] = 143; // very dark grass (far)
             palette_map[1] = 134; // slightly lighter far stripe
-            palette_map[2] = 9;   // lines (dark gray at distance)
+            palette_map[2] = 13;  // readable distant chalk
             palette_map[3] = 97;  // boost pad orange (dim)
         } else if (distance > 120 * FP_SCALE) {
             /* Mid-far: dark grass */
             palette_map[0] = 134; // dark grass
             palette_map[1] = 136; // mid-dark stripe
-            palette_map[2] = 10;  // lines (medium gray)
+            palette_map[2] = 14;  // mid-distance chalk
             palette_map[3] = 98;  // boost pad orange mid
         } else if (distance > 50 * FP_SCALE) {
             /* Mid: medium green */
@@ -467,7 +485,7 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
 
         u8 *dst = &frame_buffer[y_out * 240];
         u8 ob_color = palette_map[0];
-        u32 out_of_bounds_color = (ob_color << 24) | (ob_color << 16) | (ob_color << 8) | ob_color; // Continuous grass instead of void
+        u32 out_of_bounds_color = (u32)ob_color * 0x01010101u; // Continuous grass instead of void
         // 1. Left out-of-bounds
         if (sx_min > 0) {
             int count = sx_min > RENDER_WIDTH ? RENDER_WIDTH : sx_min;
@@ -482,7 +500,11 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
             int count = sx_max - sx_min + 1;
             u8 (*tex)[256] = pitch_texture;
 
-            // Fast unrolled 4-pixel loop for 8-bit memory
+            if (!active_pitch_mode) {
+                draw_grass_span(p,count,wz,dz,palette_map);
+                count=0;
+            }
+            // Hockey keeps its detailed two-dimensional ice texture.
             while (count >= 4) {
                 int32_t wx0 = wx; int32_t wz0 = wz;
                 int32_t wx1 = wx + dx; int32_t wz1 = wz + dz;
@@ -588,10 +610,7 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
         r20 = FP_MUL(r20, scale); r21 = FP_MUL(r21, scale); r22 = FP_MUL(r22, scale);
     }
 
-    Vector3 rot_vertices[256];
-    int screen_x[256];
-    int screen_y[256];
-    int z_proj[256];
+
     
     int v_count = mesh->vertex_count;
     if (v_count > 256) v_count = 256;
@@ -603,9 +622,9 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
         fixed y2 = (r10 * v.x + r11 * v.y + r12 * v.z) >> 12;
         fixed z2 = (r20 * v.x + r21 * v.y + r22 * v.z) >> 12;
 
-        rot_vertices[i].x = x2;
-        rot_vertices[i].y = y2;
-        rot_vertices[i].z = z2;
+        model_vertices[i].x = x2;
+        model_vertices[i].y = y2;
+        model_vertices[i].z = z2;
 
         fixed z_cam = z2 + z_offset;
         z_proj[i] = z_cam;
@@ -654,9 +673,9 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
             fixed nz_cam = (r20_light * nx + r21_light * ny + r22_light * nz) >> 12;
             intensity = (-nz_cam * 15) >> 8;
         } else {
-            Vector3 v1_3d = rot_vertices[f.v1];
-            Vector3 v2_3d = rot_vertices[f.v2];
-            Vector3 v3_3d = rot_vertices[f.v3];
+            Vector3 v1_3d = model_vertices[f.v1];
+            Vector3 v2_3d = model_vertices[f.v2];
+            Vector3 v3_3d = model_vertices[f.v3];
 
             fixed e1_x = v2_3d.x - v1_3d.x;
             fixed e1_y = v2_3d.y - v1_3d.y;
@@ -786,6 +805,57 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch) {
     cam_m22 = (cam_cos_x * cam_cos_y) >> 12;
 }
 
+/* A camera-relative offscreen pointer, bounded clear of the scoreboard/HUD. */
+int world_target_indicator(Vector3 pos, int *sx, int *sy) {
+    fixed x=pos.x-camera_pos.x,y=pos.y-camera_pos.y,z=pos.z-camera_pos.z;
+    int cx=(x*cam_m00+z*cam_m02)>>20;
+    int cy=(x*cam_m10+y*cam_m11+z*cam_m12)>>20;
+    int cz=(x*cam_m20+y*cam_m21+z*cam_m22)>>20;
+    int px=cx,py=cz<8?(cz<0?-cz:8):-cy;
+    if(cz>=8) {
+        if(cx>-cz && cx<cz && 3*cy>-2*cz && 3*cy<2*cz) return 0;
+    }
+    int ax=px<0?-px:px,ay=py<0?-py:py;
+    int scale=ax*42>ay*106?ax*42:ay*106;
+    if(!scale) return 0;
+    *sx=120+px*4452/scale;
+    *sy=72+py*4452/scale;
+    return 1;
+}
+
+/* Conservative sphere/frustum rejection avoids transforming off-screen meshes. */
+int world_sphere_visible(Vector3 pos, fixed radius) {
+    fixed x=pos.x-camera_pos.x, y=pos.y-camera_pos.y, z=pos.z-camera_pos.z;
+    fixed cx=(x*cam_m00+z*cam_m02)>>12;
+    fixed cy=(x*cam_m10+y*cam_m11+z*cam_m12)>>12;
+    fixed cz=(x*cam_m20+y*cam_m21+z*cam_m22)>>12;
+    if (cz+radius < 8*FP_SCALE) return 0;
+    if (cx > cz+2*radius || -cx > cz+2*radius) return 0;
+    if (3*cy > 2*cz+4*radius || -3*cy > 2*cz+4*radius) return 0;
+    return 1;
+}
+
+/* Clip world-space wirework at the near plane before the 2D viewport clip. */
+void draw_world_line(Vector3 a, Vector3 b, u8 color) {
+    Vector3 points[2]={a,b};
+    for(int i=0;i<2;i++) {
+        fixed x=points[i].x-camera_pos.x, y=points[i].y-camera_pos.y, z=points[i].z-camera_pos.z;
+        points[i]=(Vector3){(x*cam_m00+z*cam_m02)>>12,
+                            (x*cam_m10+y*cam_m11+z*cam_m12)>>12,
+                            (x*cam_m20+y*cam_m21+z*cam_m22)>>12};
+    }
+    a=points[0]; b=points[1];
+    const fixed near=8*FP_SCALE;
+    if(a.z<near && b.z<near) return;
+    if(a.z<near || b.z<near) {
+        int t=((near-a.z)*256)/(b.z-a.z);
+        Vector3 clipped={a.x+((b.x-a.x)*t)/256,a.y+((b.y-a.y)*t)/256,near};
+        if(a.z<near) a=clipped; else b=clipped;
+    }
+    draw_line(120+(a.x*120)/a.z,80-(a.y*120)/a.z,
+              120+(b.x*120)/b.z,80-(b.y*120)/b.z,color);
+}
+
 IWRAM_CODE int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {
     fixed rx = world_pos.x - camera_pos.x;
     fixed ry = world_pos.y - camera_pos.y;
@@ -796,8 +866,7 @@ IWRAM_CODE int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {
     fixed z_cam = (rx * cam_m20 + ry * cam_m21 + rz * cam_m22) >> 12;
     
     if (z_cam > 8 * FP_SCALE) {
-        *sx = ((x_cam * 120) / z_cam) + (120 / RENDER_SCALE);
-        *sy = ((-y_cam * 120) / z_cam) + (80 / RENDER_SCALE);
+        project_camera_point(x_cam,y_cam,z_cam,sx,sy);
         return 1;
     }
     return 0;
@@ -826,6 +895,12 @@ static inline ClipV lerp_clip(ClipV a, ClipV b, fixed t) {
 typedef struct { ClipV v[3]; } ClipTri;
 
 static int clip_tri_near(ClipV v0, ClipV v1, ClipV v2, ClipTri *out) {
+    /* Most faces are entirely in front: avoid temporary polygon construction. */
+    if(v0.z>=NEAR_PLANE && v1.z>=NEAR_PLANE && v2.z>=NEAR_PLANE) {
+        out[0].v[0]=v0;out[0].v[1]=v1;out[0].v[2]=v2;
+        return 1;
+    }
+    if(v0.z<NEAR_PLANE && v1.z<NEAR_PLANE && v2.z<NEAR_PLANE) return 0;
     /* Walk edges in source order: regrouping inside/outside vertices reverses
        winding for some cases and makes clipped panels disappear under culling. */
     ClipV verts[3] = {v0, v1, v2}, polygon[4];
@@ -851,8 +926,7 @@ static int clip_tri_near(ClipV v0, ClipV v1, ClipV v2, ClipTri *out) {
 
 static inline void project_clip_v(ClipV cv, int *sx, int *sy) {
     if (cv.z < 1) cv.z = 1;
-    *sx = ((cv.x * 120) / cv.z) + (120 / RENDER_SCALE);
-    *sy = ((-cv.y * 120) / cv.z) + (80 / RENDER_SCALE);
+    project_camera_point(cv.x,cv.y,cv.z,sx,sy);
 }
 
 /* --- World-space directional light: ~45° above, from front-right ---
@@ -869,7 +943,7 @@ static u16 face_order[MAX_SORTED_FACES] __attribute__((section(".ewram"), aligne
 static fixed face_depth[MAX_SORTED_FACES] __attribute__((section(".ewram"), aligned(4)));
 
 
-IWRAM_CODE int draw_model_world(const Mesh *mesh, Vector3 pos, int yaw, int pitch, int roll, fixed scale, int color_override, int render_mode) {
+void build_model_rotation(int yaw, int pitch, int roll, int32_t mod_m[9]) {
     int32_t sin_x = custom_sin_lut[pitch & 255];
     int32_t cos_x = custom_cos_lut[pitch & 255];
     int32_t sin_y = custom_sin_lut[yaw & 255];
@@ -880,7 +954,6 @@ IWRAM_CODE int draw_model_world(const Mesh *mesh, Vector3 pos, int yaw, int pitc
     int32_t sy_sx = (sin_y * sin_x) >> 12;
     int32_t cy_sx = (cos_y * sin_x) >> 12;
 
-    int32_t mod_m[9];
     mod_m[0] = (cos_y * cos_z + sy_sx * sin_z) >> 12;
     mod_m[1] = (-cos_y * sin_z + sy_sx * cos_z) >> 12;
     mod_m[2] = (sin_y * cos_x) >> 12;
@@ -891,6 +964,11 @@ IWRAM_CODE int draw_model_world(const Mesh *mesh, Vector3 pos, int yaw, int pitc
     mod_m[7] = (sin_y * sin_z + cy_sx * cos_z) >> 12;
     mod_m[8] = (cos_y * cos_x) >> 12;
 
+}
+
+IWRAM_CODE int draw_model_world(const Mesh *mesh, Vector3 pos, int yaw, int pitch, int roll, fixed scale, int color_override, int render_mode) {
+    int32_t mod_m[9];
+    build_model_rotation(yaw, pitch, roll, mod_m);
     return draw_model_world_mat(mesh, pos, mod_m, scale, color_override, render_mode);
 }
 
@@ -940,9 +1018,7 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
     fixed ty = (rx * cam_m10 + ry * cam_m11 + rz * cam_m12) >> 12;
     fixed tz = (rx * cam_m20 + ry * cam_m21 + rz * cam_m22) >> 12;
 
-    Vector3 cam_vertices[256];
-    int screen_x[256];
-    int screen_y[256];
+
 
     int v_count = mesh->vertex_count;
     if (v_count > 256) v_count = 256;
@@ -955,13 +1031,12 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
         fixed y_cam = ((r10 * v.x + r11 * v.y + r12 * v.z) >> 12) + ty;
         fixed z_cam = ((r20 * v.x + r21 * v.y + r22 * v.z) >> 12) + tz;
 
-        cam_vertices[i].x = x_cam;
-        cam_vertices[i].y = y_cam;
-        cam_vertices[i].z = z_cam;
+        model_vertices[i].x = x_cam;
+        model_vertices[i].y = y_cam;
+        model_vertices[i].z = z_cam;
 
         if (z_cam > 8 * FP_SCALE) {
-            screen_x[i] = ((x_cam * 120) / z_cam) + (120 / RENDER_SCALE);
-            screen_y[i] = ((-y_cam * 120) / z_cam) + (80 / RENDER_SCALE);
+            project_camera_point(x_cam,y_cam,z_cam,&screen_x[i],&screen_y[i]);
         } else {
             screen_x[i] = -999;
             screen_y[i] = -999;
@@ -974,7 +1049,7 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
     int face_count = 0;
     for (int i = 0; i < mesh->face_count; i++) {
         Face f = mesh->faces[i];
-        fixed z0 = cam_vertices[f.v1].z, z1 = cam_vertices[f.v2].z, z2 = cam_vertices[f.v3].z;
+        fixed z0 = model_vertices[f.v1].z, z1 = model_vertices[f.v2].z, z2 = model_vertices[f.v3].z;
         if (z0 < NEAR_PLANE && z1 < NEAR_PLANE && z2 < NEAR_PLANE) continue;
         /* Cull before sorting/lighting. Crossing triangles still take the full
          * clipping path, preserving their interpolated UVs and winding. */
@@ -1015,8 +1090,8 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
         if (mesh->face_normals) {
             const Vector3 *normal = &mesh->face_normals[i];
             fixed dot = (normal->x * light_x + normal->y * light_y + normal->z * light_z) >> 8;
-            /* dot is in range [-256..256] roughly; map to [2..15] */
-            intensity = 8 + ((dot * 7) >> 8);
+            /* Stadium fill light keeps unlit paint readable during a flip. */
+            intensity = 10 + ((dot * 5) >> 8);
         } else {
             intensity = 8; /* flat fallback */
         }
@@ -1030,9 +1105,9 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
         u8 color = material_shade(base_col, intensity);
 
         /* --- Near-plane clipping --- */
-        ClipV cv0 = { cam_vertices[f.v1].x, cam_vertices[f.v1].y, cam_vertices[f.v1].z, f.uv[0][0], f.uv[0][1] };
-        ClipV cv1 = { cam_vertices[f.v2].x, cam_vertices[f.v2].y, cam_vertices[f.v2].z, f.uv[1][0], f.uv[1][1] };
-        ClipV cv2 = { cam_vertices[f.v3].x, cam_vertices[f.v3].y, cam_vertices[f.v3].z, f.uv[2][0], f.uv[2][1] };
+        ClipV cv0 = { model_vertices[f.v1].x, model_vertices[f.v1].y, model_vertices[f.v1].z, f.uv[0][0], f.uv[0][1] };
+        ClipV cv1 = { model_vertices[f.v2].x, model_vertices[f.v2].y, model_vertices[f.v2].z, f.uv[1][0], f.uv[1][1] };
+        ClipV cv2 = { model_vertices[f.v3].x, model_vertices[f.v3].y, model_vertices[f.v3].z, f.uv[2][0], f.uv[2][1] };
 
         ClipTri clipped[2];
         int n_tris = clip_tri_near(cv0, cv1, cv2, clipped);
@@ -1104,4 +1179,49 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
     }
 
     return visible_faces;
+}
+
+void build_dodge_rotation(int yaw, int pitch_dir, int roll_dir, int angle, int32_t mod_m[9]) {
+    if (!pitch_dir || !roll_dir) {
+        build_model_rotation(yaw, pitch_dir * angle, roll_dir * angle, mod_m);
+        return;
+    }
+    int32_t c = custom_cos_lut[angle];
+    int32_t s = custom_sin_lut[angle];
+    int32_t v = 4096 - c;
+
+    // Normalized diagonal axis components (0.707 * 4096 = 2896)
+    int32_t ux = pitch_dir * 2896;
+    int32_t uz = roll_dir * 2896;
+
+    int32_t r_flip[9];
+    r_flip[0] = ((ux * ux >> 12) * v >> 12) + c;
+    r_flip[1] = (-uz * s) >> 12;
+    r_flip[2] = ((ux * uz >> 12) * v) >> 12;
+
+    r_flip[3] = (uz * s) >> 12;
+    r_flip[4] = c;
+    r_flip[5] = (-ux * s) >> 12;
+
+    r_flip[6] = ((ux * uz >> 12) * v) >> 12;
+    r_flip[7] = (ux * s) >> 12;
+    r_flip[8] = ((uz * uz >> 12) * v >> 12) + c;
+
+    // Base Yaw matrix
+    int32_t sy = custom_sin_lut[yaw & 255];
+    int32_t cy = custom_cos_lut[yaw & 255];
+
+    // Combined Mod matrix: Ry * R_flip
+    mod_m[0] = (cy * r_flip[0] + sy * r_flip[6]) >> 12;
+    mod_m[1] = (cy * r_flip[1] + sy * r_flip[7]) >> 12;
+    mod_m[2] = (cy * r_flip[2] + sy * r_flip[8]) >> 12;
+
+    mod_m[3] = r_flip[3];
+    mod_m[4] = r_flip[4];
+    mod_m[5] = r_flip[5];
+
+    mod_m[6] = (-sy * r_flip[0] + cy * r_flip[6]) >> 12;
+    mod_m[7] = (-sy * r_flip[1] + cy * r_flip[7]) >> 12;
+    mod_m[8] = (-sy * r_flip[2] + cy * r_flip[8]) >> 12;
+
 }

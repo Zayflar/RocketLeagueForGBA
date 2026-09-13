@@ -9,6 +9,7 @@
 #include <string.h>
 #include "engine3d.h"
 #include "models.h"
+#include "stadium.h"
 #include "coverart.h"
 
 /* --- Game State Definitions --- */
@@ -77,46 +78,46 @@ typedef struct {
 #define NUM_TUTORIAL_STAGES 6
 
 static const Vector3 tutorial_steering_gates[NUM_STEERING_GATES] = {
-    { -80 * 256, 40 * 256, -145 * 256 },
-    {  80 * 256, 40 * 256,  -55 * 256 },
-    { -25 * 256, 40 * 256,   45 * 256 }
+    { -45 * 256, 24 * 256, -145 * 256 },
+    {  45 * 256, 24 * 256,  -25 * 256 },
+    {   0, 24 * 256, 95 * 256 }
 };
 
 static const TutorialStage tutorial_stages[NUM_TUTORIAL_STAGES] = {
     {
-        { 0, 40 * 256, -190 * 256 }, 0,
+        { 0, 24 * 256, -190 * 256 }, 0,
         { 0, 0, -340 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
         TUTORIAL_DRIVE_GATE, "DRIVE THE GATE", "ACCELERATE THROUGH THE ARCH"
     },
     {
-        { -80 * 256, 40 * 256, -145 * 256 }, 0,
-        { -150 * 256, 0, -250 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
+        { -45 * 256, 24 * 256, -145 * 256 }, 0,
+        { 0, 0, -250 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
         TUTORIAL_STEER_GATES, "STEER THE SLALOM", "PASS THROUGH THREE GATES"
     },
     {
-        { 110 * 256, 40 * 256, -55 * 256 }, 24,
-        { -150 * 256, 0, -190 * 256 }, 24, { 240 * 256, 14 * 256, 260 * 256 },
-        TUTORIAL_BOOST_GATE, "BOOST TURN", "HOLD B AS YOU CROSS THE ARCH"
+        { 0, 24 * 256, -55 * 256 }, 0,
+        { 0, 0, -230 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
+        TUTORIAL_BOOST_GATE, "USE BOOST", "HOLD B THROUGH THE GATE"
     },
     {
-        { 0, 18 * 256, 110 * 256 }, 0,
+        { 0, 12 * 256, -10 * 256 }, 0,
         { 0, 0, -10 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
-        TUTORIAL_JUMP_GATE, "JUMP GATE", "PRESS A AND CLEAR THE ARCH"
+        TUTORIAL_JUMP_GATE, "FIRST JUMP", "STOP AND TAP A TO JUMP"
     },
     {
-        { 0, 30 * 256, 250 * 256 }, 0,
+        { 0, 25 * 256, 110 * 256 }, 0,
         { 0, 0, 110 * 256 }, 0, { 240 * 256, 14 * 256, 260 * 256 },
-        TUTORIAL_AERIAL_GATE, "DOUBLE JUMP", "PRESS A TWICE FOR THE HIGH ARCH"
+        TUTORIAL_AERIAL_GATE, "DOUBLE JUMP", "RELEASE D-PAD. TAP A TWICE"
     },
     {
         { 0, 40 * 256, 459 * 256 }, 0,
-        { 0, 0, 205 * 256 }, 0, { 0, 14 * 256, 180 * 256 },
+        { 0, 0, 205 * 256 }, 0, { 0, 14 * 256, 295 * 256 },
         TUTORIAL_AIM_SHOT, "SCORE A GOAL", "HIT THE BALL INTO ORANGE GOAL"
     }
 };
 
 /* Per-stage torus colours: white, cyan, orange, green, yellow-ish, orange */
-static const u8 tutorial_stage_colors[NUM_TUTORIAL_STAGES] = { 130, 129, 131, 133, 16, 131 };
+static const u8 tutorial_stage_colors[NUM_TUTORIAL_STAGES] = { 130, 129, 131, 133, 131, 131 };
 static int current_tutorial_stage = 0;
 static int current_tutorial_gate = 0;
 static TutorialProgress tutorial_progress;
@@ -147,6 +148,11 @@ static int training_timer = 0;
 static int training_touches = 0; // track number of ball touches
 static int training_post_touch_timer = 0;
 
+/* Five ticks per old frame; six per update makes angular speed 20% faster.
+ * Retain the fractional final step instead of rounding down to eight poses. */
+#define FLIP_DURATION_TICKS 50
+#define FLIP_STEP_TICKS 6
+
 /* --- Physics Structures --- */
 typedef struct {
     Vector3 pos;
@@ -157,12 +163,23 @@ typedef struct {
     int is_on_ground;
     int can_double_jump;
     int team;           // 3 = Blue, 6 = Orange
+    int boost_requested; /* consumed by physics after advancing the rotation */
     int flip_timer;
     int flip_pitch_dir;
     int flip_roll_dir;
     int visual_pitch;
     int visual_roll;
 } Car;
+
+static void build_car_rotation(const Car *car, int32_t rotation[9]) {
+    if (car->flip_timer > 0) {
+        int angle = ((FLIP_DURATION_TICKS - car->flip_timer) * 256 / FLIP_DURATION_TICKS) & 255;
+        build_dodge_rotation(car->yaw, car->flip_pitch_dir, car->flip_roll_dir, angle, rotation);
+    } else {
+        build_model_rotation(car->yaw, car->visual_pitch, car->visual_roll, rotation);
+    }
+}
+
 
 typedef struct {
     Vector3 pos;
@@ -227,6 +244,8 @@ typedef struct {
     int opponent_yaw;
     int player_pitch;
     int player_roll;
+    u8 player_flip_timer;
+    signed char player_flip_pitch_dir, player_flip_roll_dir;
     int opponent_pitch;
     int opponent_roll;
 } ReplayFrame;
@@ -292,11 +311,11 @@ static void init_boost_pads(void) {
 #define CAGE_LENGTH      ((STADIUM_LENGTH * 110) / 100)
 #define CAGE_HEIGHT      ((STADIUM_HEIGHT * 110) / 100)
 
-#define GRAVITY          (70)  // Doubled (was 35, approx 0.27 per frame)
+#define GRAVITY          ((70 * 105 + 50) / 100) // +5%, rounded to nearest 8.8 unit
 #define JUMP_FORCE       (5 * FP_SCALE)
-#define MAX_DRIVE_SPEED  ((112 * FP_SCALE) / 10) // 11.2 (was 8)
-#define ACCEL_RATE       (80)  // Doubled (was 40)
-#define BOOST_ACCEL      (170) // Increased for punchier turbo
+#define MAX_DRIVE_SPEED  ((1232 * FP_SCALE) / 100) // 10% faster driving and boost cap
+#define ACCEL_RATE       (88)  // 10% quicker acceleration for both cars
+#define BOOST_ACCEL      (187) // Match the 10% increase in driving pace
 #define DRAG_COEFF       (234) // Deceleration 2x (loses 22/256 per frame vs 11/256 previously)
 
 #define CAR_RADIUS       (13 * FP_SCALE)
@@ -335,89 +354,40 @@ void draw_soccer_pitch(Vector3 cam_pos) {
         { -CAGE_WIDTH, 0,  CAGE_LENGTH }
     };
 
-    /* Soccer markings get a crisp projected highlight over the perspective
-       texture.  Hockey uses its own red/blue rink markings only. */
     if (!is_hockey_match) {
-        Vector3 corners[4] = {
-            { -STADIUM_WIDTH, 0, -STADIUM_LENGTH },
-            {  STADIUM_WIDTH, 0, -STADIUM_LENGTH },
-            {  STADIUM_WIDTH, 0,  STADIUM_LENGTH },
-            { -STADIUM_WIDTH, 0,  STADIUM_LENGTH }
-        };
-        int sx[4], sy[4], visible[4];
-        for (int i = 0; i < 4; i++) {
-            visible[i] = project_vertex_world(corners[i], &sx[i], &sy[i]);
+        Vector3 corners[4]={{-STADIUM_WIDTH,0,-STADIUM_LENGTH},{STADIUM_WIDTH,0,-STADIUM_LENGTH},
+                            {STADIUM_WIDTH,0,STADIUM_LENGTH},{-STADIUM_WIDTH,0,STADIUM_LENGTH}};
+        for(int edge=0;edge<4;edge++) draw_world_line(corners[edge],corners[(edge+1)&3],line_color);
+        draw_world_line((Vector3){-STADIUM_WIDTH,0,0},(Vector3){STADIUM_WIDTH,0,0},line_color);
+        /* Shared projections keep the circle cheap; crossing segments use near clipping. */
+        int x[16],y[16],visible[16];
+        for(int i=0;i<16;i++) visible[i]=project_vertex_world(center_circle_pts[i],&x[i],&y[i]);
+        for(int i=0;i<16;i++) {
+            int next=(i+1)&15;
+            if(visible[i] && visible[next]) draw_line(x[i],y[i],x[next],y[next],line_color);
+            else if(visible[i] || visible[next]) draw_world_line(center_circle_pts[i],center_circle_pts[next],line_color);
         }
-
-        if (visible[0] && visible[1]) draw_line(sx[0], sy[0], sx[1], sy[1], line_color);
-        if (visible[1] && visible[2]) draw_line(sx[1], sy[1], sx[2], sy[2], line_color);
-        if (visible[2] && visible[3]) draw_line(sx[2], sy[2], sx[3], sy[3], line_color);
-        if (visible[3] && visible[0]) draw_line(sx[3], sy[3], sx[0], sy[0], line_color);
-
-        Vector3 mid_left = { -STADIUM_WIDTH, 0, 0 };
-        Vector3 mid_right = { STADIUM_WIDTH, 0, 0 };
-        int mlx, mly, mrx, mry;
-        if (project_vertex_world(mid_left, &mlx, &mly) &&
-            project_vertex_world(mid_right, &mrx, &mry)) {
-            draw_line(mlx, mly, mrx, mry, line_color);
-        }
-
-        int csx[16], csy[16], cvis[16];
-        for (int i = 0; i < 16; i++) {
-            cvis[i] = project_vertex_world(center_circle_pts[i], &csx[i], &csy[i]);
-        }
-        for (int i = 0; i < 16; i++) {
-            int next = (i + 1) & 15;
-            if (cvis[i] && cvis[next]) {
-                draw_line(csx[i], csy[i], csx[next], csy[next], line_color);
+        draw_world_line((Vector3){-2*FP_SCALE,0,0},(Vector3){2*FP_SCALE,0,0},line_color);
+        for(int side=-1;side<=1;side+=2) {
+            fixed end=side*STADIUM_LENGTH;
+            for(int area=0;area<2;area++) {
+                fixed width=(area?110:150)*FP_SCALE;
+                fixed front=end-side*(area?24:50)*FP_SCALE;
+                Vector3 left={-width,0,end},left_front={-width,0,front};
+                Vector3 right={width,0,end},right_front={width,0,front};
+                draw_world_line(left,left_front,line_color);
+                draw_world_line(left_front,right_front,line_color);
+                draw_world_line(right_front,right,line_color);
             }
-        }
-
-        Vector3 centre = { 0, 0, 0 };
-        int centre_x, centre_y;
-        if (project_vertex_world(centre, &centre_x, &centre_y)) {
-            draw_point(centre_x, centre_y, line_color);
-            draw_point(centre_x - 1, centre_y, line_color);
-            draw_point(centre_x + 1, centre_y, line_color);
+            /* Team-colored goal-mouth stripe distinguishes attack from defense. */
+            draw_world_line((Vector3){-GOAL_HALF_WIDTH,FP_SCALE,end},
+                            (Vector3){GOAL_HALF_WIDTH,FP_SCALE,end},side>0?131:146);
         }
     }
 
-    // 3D Stadium Walls (Horizontal Rails without diagonals)
-    // We only draw a wall if the camera is INSIDE that wall's bounding plane.
     int cam_x = cam_pos.x;
     int cam_z = cam_pos.z;
-
-    // 6 horizontal green wall rails (evenly spaced floor to ceiling)
-    for (int wi = 0; wi < 6; wi++) {
-        fixed wh = (CAGE_HEIGHT * wi) / 5; // 0, 1/5, 2/5, 3/5, 4/5, full height
-        Vector3 r_corners[4];
-        int rx[4], ry[4];
-        int r_vis[4];
-        for (int i = 0; i < 4; i++) {
-            r_corners[i] = cage_corners[i];
-            r_corners[i].y = wh;
-            r_vis[i] = project_vertex_world(r_corners[i], &rx[i], &ry[i]);
-        }
-
-        u8 wcol = (wi == 0) ? 130 : 133; // floor ring = white, upper rings = green
-
-        // Z = -STADIUM_LENGTH (Blue end)
-        if (cam_z >= -CAGE_LENGTH - 1000) {
-            if (r_vis[0] && r_vis[1]) draw_line(rx[0], ry[0], rx[1], ry[1], wcol);
-        }
-        // Right Touchline (X = STADIUM_WIDTH)
-        if (cam_x <= CAGE_WIDTH + 1000) {
-            if (r_vis[1] && r_vis[2]) draw_line(rx[1], ry[1], rx[2], ry[2], wcol);
-        }
-        // Z = STADIUM_LENGTH (Orange end)
-        if (cam_z <= CAGE_LENGTH + 1000) {
-            if (r_vis[2] && r_vis[3]) draw_line(rx[2], ry[2], rx[3], ry[3], wcol);
-        }
-        // Left Touchline (X = -STADIUM_WIDTH)
-        if (cam_x >= -CAGE_WIDTH - 1000) {
-            if (r_vis[3] && r_vis[0]) draw_line(rx[3], ry[3], rx[0], ry[0], wcol);
-        }
-    }
+    draw_stadium_hex_walls(cam_pos, CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT);
 
     // Vertical Pillars at corners
     Vector3 pillars[4] = { cage_corners[0], cage_corners[1], cage_corners[2], cage_corners[3] };
@@ -436,35 +406,15 @@ void draw_soccer_pitch(Vector3 cam_pos) {
             int bx, by, tx, ty;
             if (project_vertex_world(bottom, &bx, &by) && project_vertex_world(top, &tx, &ty)) {
                 u8 p_col = 130;
-                if (pillars[i].z == -CAGE_LENGTH) p_col = 3; // Blue end
-                else if (pillars[i].z == CAGE_LENGTH) p_col = 6; // Orange end
+                if (pillars[i].z == -CAGE_LENGTH) p_col = 60; // Blue end
+                else if (pillars[i].z == CAGE_LENGTH) p_col = 108; // Orange end
                 else p_col = 129; // Touchlines
                 draw_line(bx, by, tx, ty, p_col);
             }
         }
     }
 
-    if (!is_hockey_match) {
-        /* Penalty-area dimensions match init_pitch_texture exactly. */
-        fixed pa_w = GOAL_HALF_WIDTH + (40 * FP_SCALE);
-        fixed pa_d = 50 * FP_SCALE;
-        Vector3 pa1_l = { -pa_w, 0, -STADIUM_LENGTH + pa_d };
-        Vector3 pa1_r = {  pa_w, 0, -STADIUM_LENGTH + pa_d };
-        Vector3 pa1_bl = { -pa_w, 0, -STADIUM_LENGTH };
-        Vector3 pa1_br = {  pa_w, 0, -STADIUM_LENGTH };
-        Vector3 pa2_l = { -pa_w, 0, STADIUM_LENGTH - pa_d };
-        Vector3 pa2_r = {  pa_w, 0, STADIUM_LENGTH - pa_d };
-        Vector3 pa2_tl = { -pa_w, 0, STADIUM_LENGTH };
-        Vector3 pa2_tr = {  pa_w, 0, STADIUM_LENGTH };
-        int px1, py1, px2, py2;
 
-        if (project_vertex_world(pa1_bl, &px1, &py1) && project_vertex_world(pa1_l, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-        if (project_vertex_world(pa1_l, &px1, &py1) && project_vertex_world(pa1_r, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-        if (project_vertex_world(pa1_br, &px1, &py1) && project_vertex_world(pa1_r, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-        if (project_vertex_world(pa2_tl, &px1, &py1) && project_vertex_world(pa2_l, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-        if (project_vertex_world(pa2_l, &px1, &py1) && project_vertex_world(pa2_r, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-        if (project_vertex_world(pa2_tr, &px1, &py1) && project_vertex_world(pa2_r, &px2, &py2)) draw_line(px1, py1, px2, py2, line_color);
-    }
 }
 
 /* Small floodlight clusters make the cage feel like an enclosed night arena.
@@ -517,7 +467,9 @@ static void draw_car_shadow(Vector3 pos, int yaw, int model) {
         /* The dense contact core gradually shrinks as the car lifts off. */
         int width = layer ? 11 - height / 16 : 15 + height / 24;
         int length = (model == 1 ? 22 : 19) + (layer ? -height / 10 : height / 20);
-        u8 color = is_hockey_match ? (layer ? 149 : 10) : (layer ? 132 : 143);
+        u8 color = is_hockey_match
+            ? (layer && height < 40 ? SHADOW_ICE_CORE : SHADOW_ICE_EDGE)
+            : (layer && height < 40 ? SHADOW_GRASS_CORE : SHADOW_GRASS_EDGE);
         if (layer && height > 80) continue;
         vertices[0] = (Vector3){0,0,0};
         for (int i = 0; i < 8; ++i) {
@@ -557,18 +509,23 @@ static void draw_ball_ground_shadow(Vector3 ball_pos) {
         if (py >= 0 && py < RENDER_HEIGHT) {
             int left = sx - span;
             int right = sx + span;
-            u32 dark = 149 | (149 << 8) | (149 << 16) | (149 << 24);
+            u32 edge = is_hockey_match ? SHADOW_ICE_EDGE : SHADOW_GRASS_EDGE;
+            u32 dark = edge * 0x01010101u;
             if (left < 0) left = 0;
             if (right >= RENDER_WIDTH) right = RENDER_WIDTH - 1;
             if (left <= right) fast_span_fill(&frame_buffer[py * SCREEN_WIDTH + left], dark, right - left + 1);
         }
     }
 
-    /* Compact black core makes the shadow clear below a bright white ball. */
+    /* Colored contact core fades into the soft edge as the ball rises. */
+    if (height > 100) return;
     for (int dy = -1; dy <= 1; dy++) {
         int py = sy + dy;
         int span = outer_rx - 3;
-        u32 core = 132 | (132 << 8) | (132 << 16) | (132 << 24);
+        u32 color = is_hockey_match
+            ? (height < 50 ? SHADOW_ICE_CORE : SHADOW_ICE_EDGE)
+            : (height < 50 ? SHADOW_GRASS_CORE : SHADOW_GRASS_EDGE);
+        u32 core = color * 0x01010101u;
         if (span < 2) span = 2;
         if (py >= 0 && py < RENDER_HEIGHT) {
             int left = sx - span;
@@ -580,64 +537,31 @@ static void draw_ball_ground_shadow(Vector3 ball_pos) {
     }
 }
 
-void draw_radar(void) {
-    int rx = 200 / RENDER_SCALE; // radar center X
-    int ry = 30 / RENDER_SCALE;  // radar center Y
-    int scale = 30 * RENDER_SCALE; // Corrected scale: 240/30=8(half_w), 360/30=12(half_h)
-    int half_w = 8 / RENDER_SCALE;
-    int half_h = 12 / RENDER_SCALE;
-    
-    // Fill background with dark transparent-looking color (e.g. 17)
-    u32 bg_color4 = 17 | (17 << 8) | (17 << 16) | (17 << 24);
-    for (int y = ry - half_h; y <= ry + half_h; y++) {
-        if (y >= 0 && y < RENDER_HEIGHT) {
-            int left = rx - half_w;
-            int width = half_w * 2 + 1;
-            if (left >= 0 && left + width < RENDER_WIDTH) {
-                fast_span_fill(&frame_buffer[y * 240 + left], bg_color4, width);
-            }
-        }
+static void radar_point(Vector3 pos, u8 color, int player_marker) {
+    int x=22+(pos.x/FP_SCALE)*16/306;
+    int y=126-(pos.z/FP_SCALE)*24/459;
+    if(x<6)x=6;
+    if(x>38)x=38;
+    if(y<102)y=102;
+    if(y>150)y=150;
+    draw_point(x,y,color);draw_point(x-1,y,color);draw_point(x+1,y,color);
+    draw_point(x,y-1,color);draw_point(x,y+1,color);
+    if(player_marker) {
+        int dx=custom_sin_fp[player.yaw&255]*4/256;
+        int dy=-custom_cos_fp[player.yaw&255]*4/256;
+        draw_line(x,y,x+dx,y+dy,color);
     }
-
-    // Background outline
-    draw_line(rx - half_w, ry - half_h, rx + half_w, ry - half_h, 130);
-    draw_line(rx - half_w, ry + half_h, rx + half_w, ry + half_h, 130);
-    draw_line(rx - half_w, ry - half_h, rx - half_w, ry + half_h, 130);
-    draw_line(rx + half_w, ry - half_h, rx + half_w, ry + half_h, 130);
-    
-    // Midfield line
-    draw_line(rx - half_w, ry, rx + half_w, ry, 130);
-    
-    // Goals (draw as wider lines)
-    draw_line(rx - 3, ry - half_h, rx + 3, ry - half_h, 129); // Blue
-    draw_line(rx - 3, ry + half_h, rx + 3, ry + half_h, 131); // Orange
-    
-    // Player
-    int px = rx + (player.pos.x / FP_SCALE) / scale;
-    int py = ry + (player.pos.z / FP_SCALE) / scale;
-    draw_point(px, py, 129); // Cyan
-    draw_point(px-1, py, 129);
-    draw_point(px+1, py, 129);
-    draw_point(px, py-1, 129);
-    draw_point(px, py+1, 129);
-    
-    // Opponent
-    int ox = rx + (opponent.pos.x / FP_SCALE) / scale;
-    int oy = ry + (opponent.pos.z / FP_SCALE) / scale;
-    draw_point(ox, oy, 131); // Orange
-    draw_point(ox-1, oy, 131);
-    draw_point(ox+1, oy, 131);
-    draw_point(ox, oy-1, 131);
-    draw_point(ox, oy+1, 131);
-    
-    // Ball
-    int bx = rx + (ball.pos.x / FP_SCALE) / scale;
-    int by = ry + (ball.pos.z / FP_SCALE) / scale;
-    draw_point(bx, by, 130); // White
-    draw_point(bx-1, by, 130);
-    draw_point(bx+1, by, 130);
-    draw_point(bx, by-1, 130);
-    draw_point(bx, by+1, 130);
+}
+void draw_radar(void) {
+    draw_line(6,102,38,102,13);draw_line(6,150,38,150,13);
+    draw_line(6,102,6,150,13);draw_line(38,102,38,150,13);
+    draw_line(6,126,38,126,13);
+    draw_line(17,101,27,101,131); /* orange goal, forward up the map */
+    draw_line(17,151,27,151,146);
+    radar_point(player.pos,146,1);
+    if(enable_opponent && game_state!=STATE_TRAINING && game_state!=STATE_TUTORIAL)
+        radar_point(opponent.pos,131,0);
+    radar_point(ball.pos,130,0);
 }
 
 /* --- Big Minimap Overlay (shown while SELECT is held) --- */
@@ -711,15 +635,10 @@ void draw_big_radar(void) {
     draw_string("HOLD SELECT", (cx - hw) * RENDER_SCALE, (cy + hh + 4) * RENDER_SCALE, 129);
 }
 
-void spawn_boost_particle(Vector3 pos, int yaw, int pitch) {
-    fixed pitch_sin = custom_sin_fp[pitch & 255];
-    fixed pitch_cos = custom_cos_fp[pitch & 255];
-    fixed yaw_sin   = custom_sin_fp[yaw & 255];
-    fixed yaw_cos   = custom_cos_fp[yaw & 255];
-
-    fixed back_x = -FP_MUL(yaw_sin, pitch_cos);
-    fixed back_y = pitch_sin; // Fire shoots opposite to Fy (-Fy = pitch_sin)
-    fixed back_z = -FP_MUL(yaw_cos, pitch_cos);
+void spawn_boost_particle(Vector3 pos, Vector3 forward) {
+    fixed back_x = -forward.x;
+    fixed back_y = -forward.y;
+    fixed back_z = -forward.z;
 
     for (int i = 0; i < MAX_PARTICLES; i++) {
         if (particles[i].life <= 0) {
@@ -728,7 +647,7 @@ void spawn_boost_particle(Vector3 pos, int yaw, int pitch) {
             particles[i].vel.y = (back_y * 2) + ((rand() % 256) - 128);
             particles[i].vel.z = (back_z * 2) + ((rand() % 256) - 128);
             particles[i].life = 15;
-            particles[i].color = (rand() % 2 == 0) ? 6 : 130; // Alternate orange and white (fire effect)
+            particles[i].color = (rand() % 2 == 0) ? 108 : 130; // Lit orange and white exhaust
             particles[i].flags = 0;
             break;
         }
@@ -831,6 +750,9 @@ static void capture_replay_frame(void) {
     frame->opponent_yaw = opponent.yaw;
     frame->player_pitch = player.visual_pitch;
     frame->player_roll = player.visual_roll;
+    frame->player_flip_timer = player.flip_timer;
+    frame->player_flip_pitch_dir = player.flip_pitch_dir;
+    frame->player_flip_roll_dir = player.flip_roll_dir;
     frame->opponent_pitch = opponent.visual_pitch;
     frame->opponent_roll = opponent.visual_roll;
 
@@ -872,6 +794,9 @@ static void advance_goal_replay(void) {
     opponent.yaw = frame->opponent_yaw;
     player.visual_pitch = frame->player_pitch;
     player.visual_roll = frame->player_roll;
+    player.flip_timer = frame->player_flip_timer;
+    player.flip_pitch_dir = frame->player_flip_pitch_dir;
+    player.flip_roll_dir = frame->player_flip_roll_dir;
     opponent.visual_pitch = frame->opponent_pitch;
     opponent.visual_roll = frame->opponent_roll;
 
@@ -895,6 +820,7 @@ void reset_kickoff(void) {
     player.team = 3; // Blue team identity, independent of garage paint
     player.visual_pitch = 0;
     player.visual_roll = 0;
+    player.flip_timer = player.boost_requested = 0;
     camera_yaw = 0;  // Center camera behind player
 
     // Reset Opponent (Orange team) at north kickoff spot facing South (yaw = 128)
@@ -910,6 +836,7 @@ void reset_kickoff(void) {
     opponent.team = 6; // Orange override index
     opponent.visual_pitch = 0;
     opponent.visual_roll = 0;
+    opponent.flip_timer = opponent.boost_requested = 0;
 
     // Reset Ball - hockey on ground, soccer drops from air
     ball.pos.x = 0;
@@ -968,12 +895,14 @@ static void setup_tutorial_stage(void) {
     ball.pos = stage->ball_start_pos;
     ball.vel.x = 0;
     ball.vel.y = 0;
-    /* Stage 6: ball rolls toward the player so they get a moving set-piece */
-    ball.vel.z = (stage->objective == TUTORIAL_AIM_SHOT) ? (-3 * FP_SCALE) : 0;
+    /* Stationary ball ahead of the car makes the first shot easy to line up. */
+    ball.vel.z = 0;
     camera_yaw = player.yaw;
 
-    /* Show the per-stage briefing card before unlocking controls */
-    game_state = STATE_TUTORIAL_BRIEFING;
+    player.boost_requested = 0;
+    cam_mode = 0;
+    memset(particles, 0, sizeof(particles));
+    game_state = STATE_TUTORIAL;
 }
 
 static Vector3 tutorial_active_target(void) {
@@ -1003,9 +932,9 @@ static const char *tutorial_control_hint(const TutorialStage *stage) {
         case TUTORIAL_BOOST_GATE:
             return "B: HOLD BOOST";
         case TUTORIAL_JUMP_GATE:
-            return "A: JUMP";
+            return "STOP. TAP A TO JUMP";
         case TUTORIAL_AERIAL_GATE:
-            return "A: JUMP TWICE";
+            return "RELEASE D-PAD. TAP A TWICE";
         case TUTORIAL_AIM_SHOT:
             return control_scheme == 0 ? "UP: DRIVE THE BALL" : "R: DRIVE THE BALL";
     }
@@ -1017,8 +946,8 @@ static const char *tutorial_briefing_objective(const TutorialStage *stage) {
         case TUTORIAL_DRIVE_GATE:  return "ACCELERATE THROUGH ARCH";
         case TUTORIAL_STEER_GATES: return "STEER THROUGH 3 GATES";
         case TUTORIAL_BOOST_GATE:  return "BOOST THROUGH ARCH";
-        case TUTORIAL_JUMP_GATE:   return "JUMP OVER LOW ARCH";
-        case TUTORIAL_AERIAL_GATE: return "DOUBLE JUMP HIGH ARCH";
+        case TUTORIAL_JUMP_GATE:   return "JUMP ON THE SPOT";
+        case TUTORIAL_AERIAL_GATE: return "JUMP AGAIN WHILE IN AIR";
         case TUTORIAL_AIM_SHOT:    return "SCORE IN ORANGE GOAL";
     }
     return "";
@@ -1030,28 +959,79 @@ static void start_tutorial_mode(void) {
     reset_match();
     current_tutorial_stage = 0;
     tutorial_marker_pulse = 0;
-    /* setup_tutorial_stage() sets game_state = STATE_TUTORIAL_BRIEFING */
     setup_tutorial_stage();
+    game_state = STATE_TUTORIAL_BRIEFING;
 }
 
 static void complete_tutorial_stage(void) {
-    u8 stage_col = tutorial_stage_colors[current_tutorial_stage];
-    spawn_explosion(tutorial_active_target(), stage_col);
-    screen_shake = 10;
-    tutorial_flash_timer = 45; /* show "STAGE COMPLETE" flash for 45 frames */
-    current_tutorial_stage++;
-    if (current_tutorial_stage >= NUM_TUTORIAL_STAGES) {
-        current_tutorial_stage = 0;
-        tutorial_complete_timer = 300; /* 5 seconds on complete screen */
-        screen_shake = 32;
-        /* Spawn confetti at centre field */
-        Vector3 confetti_pos = { 0, 40 * FP_SCALE, 0 };
-        spawn_goal_celebration(confetti_pos, 3);
-        spawn_goal_celebration(confetti_pos, 6);
+    /* Let success remain visible before moving to the next lesson. */
+    tutorial_flash_timer = 45;
+    player.vel = (Vector3){0,0,0};
+    player.speed = 0;
+    player.boost_requested = 0;
+}
+
+static void advance_tutorial_stage(void) {
+    if (++current_tutorial_stage >= NUM_TUTORIAL_STAGES) {
+        current_tutorial_stage = NUM_TUTORIAL_STAGES - 1;
+        tutorial_complete_timer = 600;
         game_state = STATE_TUTORIAL_COMPLETE;
     } else {
-        /* Briefing card for next stage fires from setup_tutorial_stage */
         setup_tutorial_stage();
+    }
+}
+
+static void apply_player_boost(void) {
+    if (player.boost_requested) {
+        player.boost_requested = 0;
+        if (player.boost > 0) {
+            if (game_state == STATE_TUTORIAL) tutorial_progress.boosted = 1;
+            int32_t rotation[9];
+            build_car_rotation(&player, rotation);
+            /* Local +Z is the nose: column 2 of the very same rendered matrix. */
+            fixed Fx = rotation[2] >> 4;
+            fixed Fy = rotation[5] >> 4;
+            fixed Fz = rotation[8] >> 4;
+
+            fixed boost_accel = (FP_SCALE * 1848) / 1000; // 10% quicker aerial boost
+            fixed push_x = FP_MUL(Fx, boost_accel);
+            fixed push_y = FP_MUL(Fy, boost_accel);
+            fixed push_z = FP_MUL(Fz, boost_accel);
+
+            if (push_y > 30 || (!player.is_on_ground && Fy > 10)) {
+                player.is_on_ground = 0;
+            }
+
+            if (!player.is_on_ground) {
+                player.vel.x += push_x;
+                player.vel.y += push_y;
+                player.vel.z += push_z;
+
+                fixed max_vel = (198 * FP_SCALE) / 10;
+                if (player.vel.x >  max_vel) player.vel.x =  max_vel;
+                if (player.vel.x < -max_vel) player.vel.x = -max_vel;
+                if (player.vel.y >  max_vel) player.vel.y =  max_vel;
+                if (player.vel.y < -max_vel) player.vel.y = -max_vel;
+                if (player.vel.z >  max_vel) player.vel.z =  max_vel;
+                if (player.vel.z < -max_vel) player.vel.z = -max_vel;
+            } else {
+                player.speed += (BOOST_ACCEL * 11) / 10;
+                if (player.speed > MAX_DRIVE_SPEED * 18 / 10)
+                    player.speed = MAX_DRIVE_SPEED * 18 / 10;
+            }
+            player.boost -= 310;
+            if (player.boost < 0) player.boost = 0;
+            /* Transform a rear exhaust point with the centered body transform. */
+            Vector3 exhaust = car_render_position(garage_model[0], player.pos, player.yaw, rotation);
+            exhaust.x += (rotation[1] * 6 - rotation[2] * 20) / 16;
+            exhaust.y += (rotation[4] * 6 - rotation[5] * 20) / 16;
+            exhaust.z += (rotation[7] * 6 - rotation[8] * 20) / 16;
+            spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+            spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+            spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+        } else {
+            show_boost_alert = 45;
+        }
     }
 }
 
@@ -1070,24 +1050,11 @@ void update_car_physics(Car *car, int is_player) {
         car->speed = 0;
     }
 
-    // Translate position based on velocity vectors
-    car->pos.x += FP_MUL(dir_x, car->speed) + car->vel.x;
-    car->pos.z += FP_MUL(dir_z, car->speed) + car->vel.z;
-    car->pos.y += car->vel.y;
-
-    // Decay external impact velocities
-    car->vel.x = (car->vel.x * 240) >> 8;
-    car->vel.z = (car->vel.z * 240) >> 8;
-
-    // Gravity
-    if (!car->is_on_ground) {
-        car->vel.y -= GRAVITY;
-    }
-
     // Flip animation logic
     if (car->flip_timer > 0) {
-        car->flip_timer--;
-        int angle = ((16 - car->flip_timer) * 16) & 255;
+        int ticks = car->flip_timer < FLIP_STEP_TICKS ? car->flip_timer : FLIP_STEP_TICKS;
+        car->flip_timer -= ticks;
+        int angle = ((FLIP_DURATION_TICKS - car->flip_timer) * 256 / FLIP_DURATION_TICKS) & 255;
         car->visual_pitch = (car->flip_pitch_dir * angle) & 255;
         car->visual_roll = (car->flip_roll_dir * angle) & 255;
         
@@ -1106,11 +1073,34 @@ void update_car_physics(Car *car, int is_player) {
         if (car->flip_roll_dir == 1) { ax -= (c_right_x * 3) / 4; az -= (c_right_z * 3) / 4; }
         else if (car->flip_roll_dir == -1) { ax += (c_right_x * 3) / 4; az += (c_right_z * 3) / 4; }
         
-        car->vel.x += ax;
-        car->vel.z += az;
+        /* Keep the original total push with a quicker flip; diagonals have
+           the same strength as a straight dodge, not sqrt(2) times more. */
+        if (car->flip_pitch_dir && car->flip_roll_dir) {
+            ax = (ax * 181) / 256;
+            az = (az * 181) / 256;
+        }
+        car->vel.x += (ax * 16 * ticks) / FLIP_DURATION_TICKS;
+        car->vel.z += (az * 16 * ticks) / FLIP_DURATION_TICKS;
     } else if (car->is_on_ground) {
         car->visual_pitch = 0;
         car->visual_roll = 0;
+    }
+
+    // End flip animation
+    if (is_player) apply_player_boost();
+
+    // Translate position based on velocity vectors
+    car->pos.x += FP_MUL(dir_x, car->speed) + car->vel.x;
+    car->pos.z += FP_MUL(dir_z, car->speed) + car->vel.z;
+    car->pos.y += car->vel.y;
+
+    // Decay external impact velocities
+    car->vel.x = (car->vel.x * 240) >> 8;
+    car->vel.z = (car->vel.z * 240) >> 8;
+
+    // Gravity
+    if (!car->is_on_ground) {
+        car->vel.y -= GRAVITY;
     }
 
     // Floor bounds check
@@ -1533,6 +1523,11 @@ void update_ai_behavior(void) {
     }
 }
 
+static void draw_hud_text(const char *text, int x, int y, u8 color) {
+    draw_string(text,x+1,y+1,132);
+    draw_string(text,x,y,color);
+}
+
 /* --- Fast HUD String Formatters (Zero printf/division overhead) --- */
 static void fast_draw_time(int total_sec, int x, int y, u8 color) {
     int m = total_sec / 60;
@@ -1544,7 +1539,7 @@ static void fast_draw_time(int total_sec, int x, int y, u8 color) {
     buf[3] = '0' + (s / 10);
     buf[4] = '0' + (s % 10);
     buf[5] = 0;
-    draw_string(buf, x, y, color);
+    draw_hud_text(buf, x, y, color);
 }
 
 static void fast_draw_team_score(const char *prefix, int score, int x, int y, u8 color) {
@@ -1553,9 +1548,12 @@ static void fast_draw_team_score(const char *prefix, int score, int x, int y, u8
     buf[1] = prefix[1];
     buf[2] = prefix[2];
     buf[3] = ' ';
-    buf[4] = '0' + (score % 10);
-    buf[5] = 0;
-    draw_string(buf, x, y, color);
+    if(score<0)score=0;
+    if(score>99)score=99;
+    buf[4] = score>=10 ? '0'+score/10 : ' ';
+    buf[5] = '0'+score%10;
+    buf[6] = 0;
+    draw_hud_text(buf, x, y, color);
 }
 
 static void fast_draw_speed(int val, int x, int y, u8 color) {
@@ -1574,25 +1572,36 @@ static void fast_draw_speed(int val, int x, int y, u8 color) {
         buf[p++] = '0' + val;
     }
     buf[p] = 0;
-    draw_string(buf, x, y, color);
+    draw_hud_text(buf, x, y, color);
 }
 
+/* Open circular turbo dial: separated charge ticks and a lightning emblem.
+   One pass keeps the small HUD inexpensive on the GBA. */
 static void fast_draw_boost(int pct, int x, int y) {
-    char buf[10];
-    buf[0] = 'B'; buf[1] = 'S'; buf[2] = 'T'; buf[3] = ' ';
-    int p = 4;
-    if (pct >= 100) {
-        buf[p++] = '1'; buf[p++] = '0'; buf[p++] = '0';
-    } else if (pct >= 10) {
-        buf[p++] = '0' + (pct / 10);
-        buf[p++] = '0' + (pct % 10);
-    } else {
-        if (pct < 0) pct = 0;
-        buf[p++] = '0' + pct;
+    char buf[4];
+    int p=0;
+    if(pct<0) pct=0;
+    if(pct>100) pct=100;
+    u8 fuel_color=pct<20?28:131;
+    for(int i=0;i<25;i++) {
+        int angle=(160+i*8)&255;
+        u8 color=i*100<pct*25?fuel_color:149;
+        int sx=custom_sin_fp[angle], sy=custom_cos_fp[angle];
+        draw_line(x+sx*17/256,y-sy*17/256,
+                  x+sx*21/256,y-sy*21/256,color);
     }
-    buf[p++] = '%';
-    buf[p] = 0;
-    draw_string(buf, x, y, (pct < 20) ? 16 : 129);
+    /* Compact bolt above the number, with no opaque backing. */
+    draw_line(x+2,y-13,x-3,y-8,fuel_color);
+    draw_line(x-3,y-8,x+2,y-8,fuel_color);
+    draw_line(x+2,y-8,x-2,y-4,fuel_color);
+    if(pct==100) {buf[p++]='1';buf[p++]='0';buf[p++]='0';}
+    else {if(pct>=10)buf[p++]='0'+pct/10;buf[p++]='0'+pct%10;}
+    buf[p]=0;
+    draw_hud_text(buf,x-p*4,y,pct<20?28:130);
+    draw_hud_text("TURBO",x-20,y-31,131);
+    /* Small feet finish the open bottom of the dial. */
+    draw_line(x-7,y+17,x-3,y+17,fuel_color);
+    draw_line(x+3,y+17,x+7,y+17,fuel_color);
 }
 
 static void draw_hud_box(int x, int y, int width, int height, u8 fill, u8 edge) {
@@ -1604,46 +1613,50 @@ static void draw_hud_box(int x, int y, int width, int height, u8 fill, u8 edge) 
     draw_line(x, y + height - 1, x + width - 1, y + height - 1, edge);
 }
 
+static void draw_ball_indicator(void) {
+    int x,y;
+    if (!world_target_indicator(ball.pos,&x,&y)) return;
+    int dx=x-120,dy=y-72;
+    int length=abs(dx)>abs(dy)?abs(dx):abs(dy);
+    if(!length) return;
+    dx=dx*5/length;dy=dy*5/length;
+    draw_line(x,y,x-dx-dy,y-dy+dx,130);
+    draw_line(x,y,x-dx+dy,y-dy-dx,130);
+    int label_x=x-16;
+    if(label_x<4)label_x=4;
+    if(label_x>204)label_x=204;
+    draw_hud_text("BALL",label_x,y>90?y-12:y+8,130);
+}
+
 static void draw_match_hud(void) {
     int boost_pct = FP_TO_INT(player.boost);
-    int boost_width;
     if (boost_pct < 0) boost_pct = 0;
     if (boost_pct > 100) boost_pct = 100;
 
-    /* Split top plates keep the world visible while making team state legible. */
-    draw_hud_box(2, 2, 68, 18, 149, 129);
-    draw_hud_box(84, 2, 72, 18, 149, 130);
-    draw_hud_box(170, 2, 68, 18, 149, 131);
-    fast_draw_team_score("BLU", score_blue, 7, 7, 129);
-    fast_draw_time(match_timer / 60, 106, 7, 130);
-    fast_draw_team_score("ORA", score_orange, 175, 7, 131);
+    draw_ball_indicator();
+    /* Transparent text with a one-pixel shadow keeps the arena visible. */
+    fast_draw_team_score("BLU", score_blue, 40, 4, 146);
+    fast_draw_time(match_timer / 60, 100, 4, 130);
+    fast_draw_team_score("ORA", score_orange, 152, 4, 131);
+    draw_line(40,15,87,15,146);draw_line(152,15,199,15,131);
 
-    draw_hud_box(2, 141, 72, 17, 149, 130);
-    draw_hud_box(166, 141, 72, 17, 149, 129);
-    fast_draw_speed(FP_TO_INT(abs(player.speed) * 35), 7, 145, 130);
-    fast_draw_boost(boost_pct, 171, 145);
-
-    /* A narrow boost meter gives a read at a glance, even in motion. */
-    boost_width = (boost_pct * 48) / 100;
-    draw_line(185, 155, 232, 155, 128);
-    if (boost_width > 0) draw_line(185, 155, 184 + boost_width, 155, 129);
+    fast_draw_speed(FP_TO_INT(abs(player.speed) * 35), 62, 147, 130);
+    fast_draw_boost(boost_pct, 212, 136);
 
     if (game_state == STATE_REPLAY) {
-        draw_string("REPLAY", 96, 23, 131);
+        draw_hud_text("REPLAY", 62, 134, 131);
     } else if (cam_mode == 0) {
-        draw_string("CHASE CAM", 88, 23, 129);
+        draw_hud_text("L: CHASE", 62, 134, 130);
     } else {
-        draw_string("BALL CAM", 92, 23, 130);
+        draw_hud_text("L: BALL", 62, 134, 131);
     }
 }
 
 static void draw_goal_celebration_panel(void) {
     u8 team_colour = scoring_team == 3 ? 129 : 131;
-    draw_hud_box(38, 51, 164, 48, 149, team_colour);
-    draw_string(scoring_team == 3 ? "BLUE SCORED!" : "ORANGE SCORED!",
-                scoring_team == 3 ? 72 : 60, 61, team_colour);
-    draw_string("G O A L !", 84, 76, 130);
-    if ((state_timer / 12) & 1) draw_string("INSTANT REPLAY", 64, 88, 130);
+    draw_hud_text(scoring_team == 3 ? "BLUE SCORED!" : "ORANGE SCORED!",
+                scoring_team == 3 ? 72 : 60, 26, team_colour);
+    if ((state_timer / 12) & 1) draw_hud_text("INSTANT REPLAY", 64, 38, 130);
 }
 
 /* --- Main Application Frame logic ----------------------------------------- */
@@ -1688,48 +1701,12 @@ static void draw_centered_text_line(const char *text, int y, u8 color) {
 /* Briefing card — shown during STATE_TUTORIAL_BRIEFING.
    The world is frozen; controls are disabled until A is pressed.         */
 static void draw_tutorial_briefing_card(const TutorialStage *stage) {
-    char lesson[32];
-    u8   stage_col = tutorial_stage_colors[current_tutorial_stage];
-    u32  panel = 17 | (17 << 8) | (17 << 16) | (17 << 24);  /* dark glass */
-    u32  panel2 = 149 | (149 << 8) | (149 << 16) | (149 << 24);
-
-    snprintf(lesson, sizeof(lesson), "  LESSON %d/%d  ",
-             current_tutorial_stage + 1, NUM_TUTORIAL_STAGES);
-
-    /* Full-width dark panel in the middle third */
-    for (int row = 28; row <= 132; row++) {
-        fast_span_fill(&frame_buffer[row * SCREEN_WIDTH + 0], panel, 240);
-    }
-    /* Bright top + bottom edge in stage colour */
-    draw_line(0, 28,  239, 28,  stage_col);
-    draw_line(0, 132, 239, 132, stage_col);
-
-    /* Inner lighter panel for text area */
-    for (int row = 36; row <= 124; row++) {
-        fast_span_fill(&frame_buffer[row * SCREEN_WIDTH + 16], panel2, 208);
-    }
-    draw_line(16, 36, 223, 36, stage_col);
-    draw_line(16, 124, 223, 124, stage_col);
-    draw_line(16, 36, 16, 124, stage_col);
-    draw_line(223, 36, 223, 124, stage_col);
-
-    /* Lesson number header */
-    draw_centered_text_line(lesson, 44, stage_col);
-
-    /* Stage title (large visual weight) */
-    draw_centered_text_line(stage->title, 60, 130);
-
-    /* Objective line */
-    draw_centered_text_line(tutorial_briefing_objective(stage), 76, 130);
-
-    /* Control hint */
-    draw_centered_text_line(tutorial_control_hint(stage), 88, 129);
-
-    /* "Press A" prompt — blink at 30fps */
-    if ((stadium_light_phase / 15) & 1) {
-        draw_centered_text_line("PRESS A TO START", 104, stage_col);
-    }
-    draw_centered_text_line("  START: EXIT  ", 118, 128);
+    draw_hud_text("LEARN TO PLAY", 68, 42, 131);
+    draw_hud_text("6 SHORT HANDS-ON LESSONS", 28, 58, 130);
+    draw_hud_text(tutorial_briefing_objective(stage), 28, 76, 130);
+    draw_hud_text(tutorial_control_hint(stage), 28, 90, 129);
+    draw_hud_text("A: BEGIN   SELECT: RETRY", 28, 108, 130);
+    draw_hud_text("START: EXIT", 76, 122, 130);
 }
 
 /* ── HUD directional arrow pointing toward the active tutorial target ───── *
@@ -1750,13 +1727,13 @@ static void draw_tutorial_arrow(void) {
     /* Distance label, centred at bottom of HUD */
     char dist_str[20];
     snprintf(dist_str, sizeof(dist_str), "TARGET %dm", approx_dist);
-    draw_string(dist_str, (SCREEN_WIDTH - menu_text_width(dist_str)) / 2, 145, 130);
+    draw_hud_text(dist_str, (SCREEN_WIDTH - menu_text_width(dist_str)) / 2, 143, 130);
 
     if (approx_dist < 55) {
         /* NEARBY pulse */
         if ((tutorial_marker_pulse >> 5) & 1) {
             u8 nc = tutorial_stage_colors[current_tutorial_stage];
-            draw_centered_text_line("* NEARBY *", 130, nc);
+            draw_hud_text("IN RANGE", 168, 132, nc);
         }
         return;
     }
@@ -1826,23 +1803,9 @@ static void draw_tutorial_progress_bar(void) {
 
 /* 45-frame "STAGE COMPLETE!" flash overlay */
 static void draw_tutorial_stage_flash(void) {
-    u8 stage_col = tutorial_stage_colors[
-        (current_tutorial_stage == 0) ? NUM_TUTORIAL_STAGES - 1
-                                      : current_tutorial_stage - 1];
-    u32 panel = 149 | (149 << 8) | (149 << 16) | (149 << 24);
-    for (int row = 60; row <= 100; row++) {
-        fast_span_fill(&frame_buffer[row * SCREEN_WIDTH + 30], panel, 180);
-    }
-    draw_line(30, 60, 209, 60, stage_col);
-    draw_line(30, 100, 209, 100, stage_col);
-    draw_line(30, 60, 30, 100, stage_col);
-    draw_line(209, 60, 209, 100, stage_col);
-    draw_centered_text_line("STAGE COMPLETE!", 72, stage_col);
-    if ((tutorial_flash_timer / 8) & 1) {
-        draw_centered_text_line("WELL DONE!", 84, 130);
-    }
+    draw_hud_text("LESSON COMPLETE!", 60, 68, 131);
+    draw_hud_text("NEXT LESSON...", 68, 82, 130);
 }
-
 
 static void draw_fixed_width_menu_item(const char *text, int y, int selected) {
     draw_menu_text_box(text, y, selected ? 131 : 130, 136);
@@ -1966,7 +1929,8 @@ static void handle_player_input(void) {
     int turn_rate = player.is_on_ground ? 4 : 3;
     if (is_drifting) turn_rate = 10;
     
-    int block_yaw = (!player.is_on_ground && btn_aerial_mod);
+    int block_yaw = player.flip_timer > 0 ||
+        (!player.is_on_ground && (btn_aerial_mod || btn_jump));
 
     if (!block_yaw) {
         if (btn_left)  player.yaw = (player.yaw - turn_rate) & 255;
@@ -2026,7 +1990,7 @@ static void handle_player_input(void) {
     /* Camera cycle is handled globally in the game loop via KEY_L hit */
 
     // Aerial Pitch/Roll
-    if (btn_aerial_mod && !player.is_on_ground) {
+    if (btn_aerial_mod && !player.is_on_ground && player.flip_timer == 0 && !btn_jump) {
         if (key_is_down(KEY_UP))    player.visual_pitch = (player.visual_pitch + 4) & 255;
         if (key_is_down(KEY_DOWN))  player.visual_pitch = (player.visual_pitch - 4) & 255;
         if (key_is_down(KEY_LEFT))  player.visual_roll  = (player.visual_roll  + 8) & 255;
@@ -2050,7 +2014,7 @@ static void handle_player_input(void) {
             if (!is_forward && !is_back && !is_left && !is_right) {
                 player.vel.y = (JUMP_FORCE * 3) / 5;
             } else {
-                player.flip_timer = 16;
+                player.flip_timer = FLIP_DURATION_TICKS;
                 if (is_forward) player.flip_pitch_dir = 1;
                 else if (is_back) player.flip_pitch_dir = -1;
                 else player.flip_pitch_dir = 0;
@@ -2065,53 +2029,8 @@ static void handle_player_input(void) {
         }
     }
 
-    // Boost
-    if (btn_boost) {
-        if (player.boost > 0) {
-            if (game_state == STATE_TUTORIAL) tutorial_progress.boosted = 1;
-            fixed pitch_sin = custom_sin_fp[player.visual_pitch & 255];
-            fixed pitch_cos = custom_cos_fp[player.visual_pitch & 255];
-            fixed yaw_sin   = custom_sin_fp[player.yaw & 255];
-            fixed yaw_cos   = custom_cos_fp[player.yaw & 255];
+    player.boost_requested = btn_boost;
 
-            fixed Fx = FP_MUL(yaw_sin, pitch_cos);
-            fixed Fy = -pitch_sin;
-            fixed Fz = FP_MUL(yaw_cos, pitch_cos);
-
-            fixed boost_accel = (FP_SCALE * 168) / 100;
-            fixed push_x = FP_MUL(Fx, boost_accel);
-            fixed push_y = FP_MUL(Fy, boost_accel);
-            fixed push_z = FP_MUL(Fz, boost_accel);
-
-            if (push_y > 30 || (!player.is_on_ground && Fy > 10)) {
-                player.is_on_ground = 0;
-            }
-
-            if (!player.is_on_ground) {
-                player.vel.x += push_x;
-                player.vel.y += push_y;
-                player.vel.z += push_z;
-
-                fixed max_vel = 18 * FP_SCALE;
-                if (player.vel.x >  max_vel) player.vel.x =  max_vel;
-                if (player.vel.x < -max_vel) player.vel.x = -max_vel;
-                if (player.vel.y >  max_vel) player.vel.y =  max_vel;
-                if (player.vel.y < -max_vel) player.vel.y = -max_vel;
-                if (player.vel.z >  max_vel) player.vel.z =  max_vel;
-                if (player.vel.z < -max_vel) player.vel.z = -max_vel;
-            } else {
-                player.speed += (BOOST_ACCEL * 11) / 10;
-                if (player.speed > MAX_DRIVE_SPEED * 18 / 10)
-                    player.speed = MAX_DRIVE_SPEED * 18 / 10;
-            }
-            player.boost -= 310;
-            spawn_boost_particle(player.pos, player.yaw, player.visual_pitch);
-            spawn_boost_particle(player.pos, player.yaw, player.visual_pitch);
-            spawn_boost_particle(player.pos, player.yaw, player.visual_pitch);
-        } else {
-            show_boost_alert = 45;
-        }
-    }
 }
 
 int main(void) {
@@ -2358,14 +2277,21 @@ int main(void) {
                         ? STATE_MENU_TRAINING : STATE_TITLE;
                     break;
                 }
+                if (game_state == STATE_TUTORIAL) {
+                    if (key_hit(KEY_SELECT)) { setup_tutorial_stage(); break; }
+                    if (tutorial_flash_timer > 0) {
+                        tutorial_flash_timer -= dt_time_frames;
+                        if (tutorial_flash_timer <= 0) advance_tutorial_stage();
+                        break;
+                    }
+                    player.boost = 100 * FP_SCALE;
+                }
                 /* L button always cycles camera */
                 if (key_hit(KEY_L)) cam_mode = (cam_mode + 1) % 2;
                 handle_player_input();
 
                 if (game_state == STATE_TUTORIAL) {
                     tutorial_marker_pulse = (tutorial_marker_pulse + 3) & 255;
-                    /* Count down the stage-completion flash */
-                    if (tutorial_flash_timer > 0) tutorial_flash_timer -= dt_time_frames;
                 }
 
                 // Shared physics updates for solo modes (Tutorial & Training)
@@ -2397,10 +2323,10 @@ int main(void) {
                     if (stage->objective == TUTORIAL_DRIVE_GATE) {
                         completed = tutorial_progress.accelerated &&
                             abs(player.speed) > 2 * FP_SCALE &&
-                            tutorial_target_reached(player.pos, stage->target_pos, 38);
+                            tutorial_target_reached(player.pos, stage->target_pos, 48);
                     } else if (stage->objective == TUTORIAL_STEER_GATES) {
                         Vector3 gate = tutorial_active_target();
-                        if (tutorial_progress.steered && tutorial_target_reached(player.pos, gate, 38)) {
+                        if (tutorial_progress.steered && tutorial_target_reached(player.pos, gate, 48)) {
                             if (current_tutorial_gate == NUM_STEERING_GATES - 1) {
                                 completed = 1;
                             } else {
@@ -2410,15 +2336,13 @@ int main(void) {
                         }
                     } else if (stage->objective == TUTORIAL_BOOST_GATE) {
                         completed = tutorial_progress.boosted && key_is_down(KEY_B) &&
-                            tutorial_target_reached(player.pos, stage->target_pos, 38);
+                            tutorial_target_reached(player.pos, stage->target_pos, 48);
                     } else if (stage->objective == TUTORIAL_JUMP_GATE) {
                         completed = tutorial_progress.jumped && !player.is_on_ground &&
-                            player.pos.y > 8 * FP_SCALE &&
-                            tutorial_target_reached(player.pos, stage->target_pos, 32);
+                            player.pos.y > 8 * FP_SCALE;
                     } else if (stage->objective == TUTORIAL_AERIAL_GATE) {
                         completed = tutorial_progress.double_jumped && !player.is_on_ground &&
-                            player.pos.y > 22 * FP_SCALE &&
-                            tutorial_target_reached(player.pos, stage->target_pos, 32);
+                            player.pos.y > 18 * FP_SCALE;
                     } else if (stage->objective == TUTORIAL_AIM_SHOT) {
                         completed = tutorial_progress.ball_touched && tutorial_ball_scored();
                     }
@@ -2442,8 +2366,6 @@ int main(void) {
                 break;
 
             case STATE_TUTORIAL_COMPLETE:
-                /* Keep confetti alive */
-                update_and_draw_particles();
                 if (tutorial_complete_timer > 0) tutorial_complete_timer -= dt_time_frames;
                 /* Player can exit early with START, or auto-exit after timer */
                 if (key_hit(KEY_START) || tutorial_complete_timer <= 0) game_state = STATE_TITLE;
@@ -2651,6 +2573,8 @@ int main(void) {
             u8 sky_col = is_hockey_match ? 14 : 128; /* bright white/light for hockey arena */
             draw_environment_background(sky_col);
 
+            draw_stadium_crowd(cam_pos, CAGE_WIDTH, CAGE_LENGTH);
+
             // Draw 3D Soccer Pitch Lines
             draw_soccer_pitch(cam_pos);
             draw_stadium_floodlights();
@@ -2662,15 +2586,10 @@ int main(void) {
             }
             draw_ball_ground_shadow(ball.pos);
 
-            // Draw Blue Goal Net
-            Vector3 blue_goal_pos = { 0, 0, -STADIUM_LENGTH };
-            u8 goal_color_b = is_hockey_match ? 5 : 3; /* Cyan for hockey, blue for soccer */
-            draw_model_world(&goal_mesh, blue_goal_pos, 128, 0, 0, GOAL_RENDER_SCALE, goal_color_b, RENDER_OUTLINED_WHITE);
-
-            // Draw Orange/Red Goal Net
-            Vector3 orange_goal_pos = { 0, 0, STADIUM_LENGTH };
-            u8 goal_color_o = is_hockey_match ? 1 : 6; /* Red for hockey, orange for soccer */
-            draw_model_world(&goal_mesh, orange_goal_pos, 0, 0, 0, GOAL_RENDER_SCALE, goal_color_o, RENDER_OUTLINED_WHITE);
+            draw_stadium_goal(-STADIUM_LENGTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
+                              is_hockey_match ? 5 : 146);
+            draw_stadium_goal(STADIUM_LENGTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
+                              is_hockey_match ? 28 : 131);
 
             if (game_state == STATE_TUTORIAL || game_state == STATE_TUTORIAL_BRIEFING) {
                 const TutorialStage *stage = &tutorial_stages[current_tutorial_stage];
@@ -2678,14 +2597,23 @@ int main(void) {
                 Vector3 beacon_base = target;
                 Vector3 beacon_top = target;
                 int bx, by, tx, ty;
-                fixed marker_scale = FP_ONE +
-                    ((custom_sin_fp[tutorial_marker_pulse] + FP_ONE) >> 4);
                 u8 torus_col = tutorial_stage_colors[current_tutorial_stage];
 
                 beacon_base.y = 0;
                 beacon_top.y += 48 * FP_SCALE;
-                draw_model_world(&torus_mesh, tutorial_active_target(), stage->target_yaw,
-                                 0, 0, marker_scale, torus_col, RENDER_WIREFRAME);
+                Vector3 gate = tutorial_active_target();
+                static const signed char gate_ring[8][2] = {
+                    {-30,-18},{30,-18},{40,-8},{40,18},
+                    {30,28},{-30,28},{-40,18},{-40,-8}
+                };
+                for (int edge=0;edge<8;edge++) {
+                    int next=(edge+1)&7;
+                    Vector3 a={gate.x+gate_ring[edge][0]*FP_SCALE,
+                               gate.y+gate_ring[edge][1]*FP_SCALE,gate.z};
+                    Vector3 b={gate.x+gate_ring[next][0]*FP_SCALE,
+                               gate.y+gate_ring[next][1]*FP_SCALE,gate.z};
+                    draw_world_line(a,b,torus_col);
+                }
                 if (project_vertex_world(beacon_base, &bx, &by) &&
                     project_vertex_world(beacon_top, &tx, &ty)) {
                     draw_line(bx, by, tx, ty, torus_col);
@@ -2816,19 +2744,22 @@ int main(void) {
             int32_t pdx = (player.pos.x - cam_pos.x) >> 8;
             int32_t pdz = (player.pos.z - cam_pos.z) >> 8;
             items[0].id = 0;
-            items[0].dist = pdx * pdx + pdz * pdz;
+            int32_t pdy = (player.pos.y - cam_pos.y) >> 8;
+            items[0].dist = pdx * pdx + pdy * pdy + pdz * pdz;
             
             // Opponent distance
             int32_t odx = (opponent.pos.x - cam_pos.x) >> 8;
             int32_t odz = (opponent.pos.z - cam_pos.z) >> 8;
             items[1].id = 1;
-            items[1].dist = odx * odx + odz * odz;
+            int32_t ody = (opponent.pos.y - cam_pos.y) >> 8;
+            items[1].dist = odx * odx + ody * ody + odz * odz;
             
             // Ball distance
             int32_t bdx = (ball.pos.x - cam_pos.x) >> 8;
             int32_t bdz = (ball.pos.z - cam_pos.z) >> 8;
             items[2].id = 2;
-            items[2].dist = bdx * bdx + bdz * bdz;
+            int32_t bdy = (ball.pos.y - cam_pos.y) >> 8;
+            items[2].dist = bdx * bdx + bdy * bdy + bdz * bdz;
             
             // Sort items descending (furthest first)
             for (int i = 0; i < 2; i++) {
@@ -2849,56 +2780,17 @@ int main(void) {
 
             // Draw objects in sorted order
             for (int i = 0; i < 3; i++) {
+                Vector3 object_pos = items[i].id==0 ? player.pos : items[i].id==1 ? opponent.pos : ball.pos;
+                if (!world_sphere_visible(object_pos, (items[i].id==2 ? 16 : 48)*FP_SCALE)) continue;
                 if (items[i].id == 0) {
-                    if (player.flip_pitch_dir != 0 && player.flip_roll_dir != 0 && player.flip_timer > 0) {
-                        // Diagonal flip: Construct custom axis-angle matrix
-                        int32_t angle = ((16 - player.flip_timer) * 16) & 255;
-                        int32_t c = custom_cos_lut[angle];
-                        int32_t s = custom_sin_lut[angle];
-                        int32_t v = 4096 - c;
-                        
-                        // Normalized diagonal axis components (0.707 * 4096 = 2896)
-                        int32_t ux = player.flip_pitch_dir * 2896;
-                        int32_t uz = player.flip_roll_dir * 2896;
-                        
-                        int32_t r_flip[9];
-                        r_flip[0] = ((ux * ux >> 12) * v >> 12) + c;
-                        r_flip[1] = (-uz * s) >> 12;
-                        r_flip[2] = ((ux * uz >> 12) * v) >> 12;
-                        
-                        r_flip[3] = (uz * s) >> 12;
-                        r_flip[4] = c;
-                        r_flip[5] = (-ux * s) >> 12;
-                        
-                        r_flip[6] = ((ux * uz >> 12) * v) >> 12;
-                        r_flip[7] = (ux * s) >> 12;
-                        r_flip[8] = ((uz * uz >> 12) * v >> 12) + c;
-                        
-                        // Base Yaw matrix
-                        int32_t sy = custom_sin_lut[player.yaw & 255];
-                        int32_t cy = custom_cos_lut[player.yaw & 255];
-                        
-                        // Combined Mod matrix: Ry * R_flip
-                        int32_t mod_m[9];
-                        mod_m[0] = (cy * r_flip[0] + sy * r_flip[6]) >> 12;
-                        mod_m[1] = (cy * r_flip[1] + sy * r_flip[7]) >> 12;
-                        mod_m[2] = (cy * r_flip[2] + sy * r_flip[8]) >> 12;
-                        
-                        mod_m[3] = r_flip[3];
-                        mod_m[4] = r_flip[4];
-                        mod_m[5] = r_flip[5];
-                        
-                        mod_m[6] = (-sy * r_flip[0] + cy * r_flip[6]) >> 12;
-                        mod_m[7] = (-sy * r_flip[1] + cy * r_flip[7]) >> 12;
-                        mod_m[8] = (-sy * r_flip[2] + cy * r_flip[8]) >> 12;
-                        
-                        draw_model_world_mat(car_models[garage_model[0]], player.pos, mod_m, FP_ONE, team_paints[0][garage_paint[0]], RENDER_TEXTURED);
-                    } else {
-                        draw_model_world(car_models[garage_model[0]], player.pos, player.yaw, player.visual_pitch, player.visual_roll, FP_ONE, team_paints[0][garage_paint[0]], RENDER_TEXTURED);
-                    }
+                    int32_t mod_m[9];
+                    build_car_rotation(&player, mod_m);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[0], items[i].dist), car_render_position(garage_model[0], player.pos, player.yaw, mod_m), mod_m, FP_ONE, team_paints[0][garage_paint[0]], RENDER_TEXTURED);
                 } else if (items[i].id == 1 && enable_opponent &&
                            game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
-                    draw_model_world(car_models[garage_model[1]], opponent.pos, opponent.yaw, opponent.visual_pitch, opponent.visual_roll, FP_ONE, team_paints[1][garage_paint[1]], RENDER_TEXTURED);
+                    int32_t mod_m[9];
+                    build_model_rotation(opponent.yaw, opponent.visual_pitch, opponent.visual_roll, mod_m);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[1], items[i].dist), car_render_position(garage_model[1], opponent.pos, opponent.yaw, mod_m), mod_m, FP_ONE, team_paints[1][garage_paint[1]], RENDER_TEXTURED);
                 } else if (items[i].id == 2) {
                     if (is_hockey_match) {
                         /* Hockey: draw puck (white flat cylinder) */
@@ -2906,7 +2798,7 @@ int main(void) {
                     } else {
                         /* White ball material uses its dedicated diffuse ramp,
                            producing surface shadows plus a true-white highlight. */
-                        draw_model_world(&sphere_mesh, ball.pos, ball_spin_y, ball_spin_x, 0,
+                        draw_model_world(ball_gameplay_mesh(items[i].dist), ball.pos, ball_spin_y, ball_spin_x, 0,
                                          FP_SCALE / 3 * 2, 130, RENDER_FLAT);
                     }
                 }
@@ -2916,9 +2808,9 @@ int main(void) {
             update_and_draw_particles();
             
             // Draw Minimap Radar (big when SELECT held)
-            if (key_is_down(KEY_SELECT) && game_state != STATE_PAUSED) {
+            if (key_is_down(KEY_SELECT) && game_state != STATE_PAUSED && game_state != STATE_TUTORIAL) {
                 draw_big_radar();
-            } else {
+            } else if (game_state!=STATE_TUTORIAL && game_state!=STATE_TUTORIAL_BRIEFING && game_state!=STATE_TUTORIAL_COMPLETE) {
                 draw_radar();
             }
 
@@ -2927,17 +2819,17 @@ int main(void) {
                 game_state == STATE_GOAL || game_state == STATE_REPLAY ||
                 game_state == STATE_PAUSED) {
                 draw_match_hud();
-            } else if (game_state != STATE_TUTORIAL_BRIEFING) {
+            } else if (game_state != STATE_TUTORIAL_BRIEFING && game_state != STATE_TUTORIAL) {
                 /* Solo modes: minimal driving readout */
                 int speed_val = FP_TO_INT(abs(player.speed) * 35);
-                fast_draw_speed(speed_val, 4, 148, 130);
-                fast_draw_boost(FP_TO_INT(player.boost), 192, 148);
+                fast_draw_speed(speed_val, 62, 147, 130);
+                fast_draw_boost(FP_TO_INT(player.boost), 212, 136);
             }
 
             // Mid-screen alerts (Y=72, centred) – only one shown at a time
             if (show_boost_alert > 0) {
                 show_boost_alert--;
-                draw_string("NO BOOST!", 84, 72, 16);      // Red warning
+                draw_hud_text("BOOST EMPTY", 72, 119, 28);      // Red warning
             }
 
             if (game_state == STATE_TUTORIAL || game_state == STATE_TUTORIAL_BRIEFING) {
@@ -2949,9 +2841,10 @@ int main(void) {
                     snprintf(tut_str, sizeof(tut_str), "TUT %d/%d",
                              current_tutorial_stage + 1, NUM_TUTORIAL_STAGES);
                     draw_string(tut_str, 2, 2, tutorial_stage_colors[current_tutorial_stage]);
-                    draw_string("START:EXIT", 158, 2, 128);
+                    draw_hud_text("START:EXIT", 158, 2, 130);
                     draw_string(stage->title, 2, 12, 130);
-                    draw_string(tutorial_control_hint(stage), 2, 22, 129);
+                    draw_hud_text(tutorial_control_hint(stage), 2, 22, 129);
+                    draw_hud_text("SELECT: RETRY", 4, 132, 130);
 
                     /* Gate counter for slalom */
                     if (stage->objective == TUTORIAL_STEER_GATES) {
@@ -2976,23 +2869,10 @@ int main(void) {
                     draw_tutorial_briefing_card(stage);
                 }
             } else if (game_state == STATE_TUTORIAL_COMPLETE) {
-                /* Big completion panel */
-                u32 panel = 17 | (17 << 8) | (17 << 16) | (17 << 24);
-                for (int row = 38; row <= 122; row++) {
-                    fast_span_fill(&frame_buffer[row * SCREEN_WIDTH + 10], panel, 220);
-                }
-                draw_line(10, 38, 229, 38, 131);
-                draw_line(10, 122, 229, 122, 131);
-                draw_line(10, 38, 10, 122, 131);
-                draw_line(229, 38, 229, 122, 131);
-                draw_centered_text_line("TUTORIAL COMPLETE!", 50, 131);
-                /* Three gold stars */
-                draw_centered_text_line("* * *", 66, 16);
-                draw_centered_text_line("YOU ARE READY TO PLAY!", 82, 130);
-                if ((timer_accumulator / 20) & 1) {
-                    draw_centered_text_line("A: PLAY A MATCH", 96, 129);
-                }
-                draw_centered_text_line("START: MAIN MENU", 110, 128);
+                draw_hud_text("TUTORIAL COMPLETE!", 52, 50, 131);
+                draw_hud_text("YOU ARE READY TO PLAY", 40, 72, 130);
+                draw_hud_text("A: PLAY A MATCH", 60, 94, 129);
+                draw_hud_text("START: MAIN MENU", 56, 110, 130);
             } else if (game_state == STATE_TRAINING) {
                 char tr_str[32];
                 snprintf(tr_str, sizeof(tr_str), "TRAINING %d/%d", current_training_level+1, NUM_TRAINING_LEVELS);
@@ -3020,20 +2900,19 @@ int main(void) {
             if (game_state == STATE_GOAL) {
                 draw_goal_celebration_panel();
             } else if (game_state == STATE_REPLAY) {
-                draw_hud_box(66, 125, 108, 13, 149, 131);
-                draw_string("A/START: SKIP", 76, 128, 130);
+                draw_hud_text("A/START: SKIP", 76, 128, 130);
             }
 
             if (game_state == STATE_GAMEOVER) {
                 // Winner Y=60, press start Y=76
                 if (score_blue > score_orange) {
-                    draw_string("BLUE WINS!", 80, 60, 129);
+                    draw_hud_text("BLUE WINS!", 80, 60, 129);
                 } else if (score_orange > score_blue) {
-                    draw_string("ORANGE WINS!", 72, 60, 131);
+                    draw_hud_text("ORANGE WINS!", 72, 60, 131);
                 } else {
-                    draw_string("DRAW!", 108, 60, 130);
+                    draw_hud_text("DRAW!", 108, 60, 130);
                 }
-                draw_string("START:REPLAY", 72, 76, 130);
+                draw_hud_text("START:REPLAY", 72, 76, 130);
             }
 
             /* ==== PAUSE OVERLAY ==== */

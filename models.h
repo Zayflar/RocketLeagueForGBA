@@ -14,6 +14,12 @@ extern Mesh pyramid_mesh;
 extern Mesh spaceship_mesh;
 #define CAR_MODEL_COUNT 3
 extern const Mesh *const car_models[CAR_MODEL_COUNT];
+extern const Mesh *const car_match_models[CAR_MODEL_COUNT];
+extern const Mesh *const car_far_models[CAR_MODEL_COUNT];
+const Mesh *car_gameplay_mesh(int model, int distance_sq);
+const Mesh *ball_gameplay_mesh(int distance_sq);
+/* Keep the mesh bounds center fixed while pitching/rolling around a yawed car. */
+Vector3 car_render_position(int model, Vector3 pos, int yaw, const int32_t rotation[9]);
 extern Mesh rover_mesh;
 extern Mesh car_mesh;
 extern Mesh opp_car_mesh;

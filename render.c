@@ -308,7 +308,7 @@ IWRAM_CODE void draw_triangle_flat_clipped(int x0, int y0, int x1, int y1, int x
     u32 color4 = (u32)color * 0x01010101u;
 
     int32_t dy_02 = y2 - y0;
-    int32_t dx_long = (x2 - x0) * custom_div_lut[dy_02];
+    int32_t dx_long = (x2 - x0) * (dy_02 < 2048 ? custom_div_lut[dy_02] : 65536 / dy_02);
 
     int32_t dx1 = x1 - x0;
     int32_t dy1 = y1 - y0;
@@ -318,9 +318,9 @@ IWRAM_CODE void draw_triangle_flat_clipped(int x0, int y0, int x1, int y1, int x
 
     if (y1 > y0) {
         int32_t dy_01 = y1 - y0;
-        int32_t dx_short = (x1 - x0) * custom_div_lut[dy_01];
-        int32_t xa = x0 << 16;
-        int32_t xb = x0 << 16;
+        int32_t dx_short = (x1 - x0) * (dy_01 < 2048 ? custom_div_lut[dy_01] : 65536 / dy_01);
+        int32_t xa = x0 * 65536;
+        int32_t xb = x0 * 65536;
         if (y0 < 0) {
             xa += dx_long * (-y0);
             xb += dx_short * (-y0);
@@ -345,11 +345,11 @@ IWRAM_CODE void draw_triangle_flat_clipped(int x0, int y0, int x1, int y1, int x
             }
         }
     }
-    if (y2 > y1) {
+    if (y2 > y1 && y1 < RENDER_HEIGHT) {
         int32_t dy_12 = y2 - y1;
-        int32_t dx_short = (x2 - x1) * custom_div_lut[dy_12];
-        int32_t xa = (x0 << 16) + dx_long * (y1 - y0);
-        int32_t xb = x1 << 16;
+        int32_t dx_short = (x2 - x1) * (dy_12 < 2048 ? custom_div_lut[dy_12] : 65536 / dy_12);
+        int32_t xa = (x0 * 65536) + dx_long * (y1 - y0);
+        int32_t xb = x1 * 65536;
         int y_start = y1 < 0 ? 0 : y1;
         if (y1 < 0) {
             xa += dx_long * (-y1);

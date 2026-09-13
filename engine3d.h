@@ -121,12 +121,26 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch);
  * @return 1 if point is in front of camera (renderable), 0 if behind (clipped).
  */
 int project_vertex_world(Vector3 world_pos, int *sx, int *sy);
+void draw_world_line(Vector3 a, Vector3 b, u8 color);
+int world_sphere_visible(Vector3 pos, fixed radius);
+int world_target_indicator(Vector3 pos, int *sx, int *sy);
 
 /**
  * @brief Transform, project, light, and render a 3D Mesh in world coordinates relative to the camera.
  * @param color_override If >= 0, overrides the base color of all faces (useful for teams)
  * @return Number of visible/rendered polygons
  */
+/* Dedicated environment colors, separate from UI and black tyre materials. */
+enum {
+    SHADOW_GRASS_EDGE = 158, SHADOW_GRASS_CORE,
+    SHADOW_ICE_EDGE, SHADOW_ICE_CORE,
+    SKY_GRADIENT_START, SKY_GRADIENT_COUNT = 16,
+    ICE_SURFACE_STRIPE = SKY_GRADIENT_START + SKY_GRADIENT_COUNT,
+    STAND_DARK, STAND_LIGHT, STAND_RAIL, CROWD_BLUE, CROWD_ORANGE, CROWD_NEUTRAL, WALL_HEX
+};
+
+void build_dodge_rotation(int yaw, int pitch_dir, int roll_dir, int angle, int32_t mod_m[9]);
+void build_model_rotation(int yaw, int pitch, int roll, int32_t mod_m[9]);
 int draw_model_world(const Mesh *mesh, Vector3 pos, int yaw, int pitch, int roll, fixed scale, int color_override, int render_mode);
 int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t mod_m[9], fixed scale, int color_override, int render_mode);
 
