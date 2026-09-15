@@ -6,6 +6,8 @@
 #include "engine3d.h"
 #include <string.h>
 
+int performance_mode=1;
+
 /* --- Shared EWRAM Frame Buffer --- */
 u8 frame_buffer[240 * 160] __attribute__((section(".ewram"), aligned(4)));
 
@@ -835,6 +837,29 @@ int world_sphere_visible(Vector3 pos, fixed radius) {
     return 1;
 }
 
+/* Conservative box/frustum rejection for long stadium strips. A sphere
+   around a whole wall is too large to reject the wall behind the camera. */
+int world_bounds_visible(Vector3 lo, Vector3 hi) {
+    unsigned outside=31;
+    for(int i=0;i<8;i++) {
+        fixed x=((i&1)?hi.x:lo.x)-camera_pos.x;
+        fixed y=((i&2)?hi.y:lo.y)-camera_pos.y;
+        fixed z=((i&4)?hi.z:lo.z)-camera_pos.z;
+        fixed cx=(x*cam_m00+z*cam_m02)>>12;
+        fixed cy=(x*cam_m10+y*cam_m11+z*cam_m12)>>12;
+        fixed cz=(x*cam_m20+y*cam_m21+z*cam_m22)>>12;
+        /* Expand by one screen pixel plus two world units so integer
+           projection cannot turn a rejected edge into a visible pixel. */
+        const int pad=2*FP_SCALE;
+        unsigned mask=(cz<8*FP_SCALE-pad?1:0) |
+            (120*cx>121*cz+120*pad?2:0) | (-120*cx>121*cz+120*pad?4:0) |
+            (120*cy>81*cz+120*pad?8:0) | (-120*cy>81*cz+120*pad?16:0);
+        outside &= mask;
+        if(!outside)return 1;
+    }
+    return 0;
+}
+
 /* Clip world-space wirework at the near plane before the 2D viewport clip. */
 void draw_world_line(Vector3 a, Vector3 b, u8 color) {
     Vector3 points[2]={a,b};
@@ -852,8 +877,10 @@ void draw_world_line(Vector3 a, Vector3 b, u8 color) {
         Vector3 clipped={a.x+((b.x-a.x)*t)/256,a.y+((b.y-a.y)*t)/256,near};
         if(a.z<near) a=clipped; else b=clipped;
     }
-    draw_line(120+(a.x*120)/a.z,80-(a.y*120)/a.z,
-              120+(b.x*120)/b.z,80-(b.y*120)/b.z,color);
+    int ax,ay,bx,by;
+    project_camera_point(a.x,a.y,a.z,&ax,&ay);
+    project_camera_point(b.x,b.y,b.z,&bx,&by);
+    draw_line(ax,ay,bx,by,color);
 }
 
 IWRAM_CODE int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {

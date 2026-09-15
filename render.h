@@ -41,6 +41,7 @@ void clear_screen(u8 color);
  * @brief Copy EWRAM frame buffer to the active GBA VRAM page.
  */
 void swap_buffers(void);
+void video_vblank(void);
 
 /**
  * @brief Draw a 2x2 point on the screen (scaled automatically by RENDER_SCALE).

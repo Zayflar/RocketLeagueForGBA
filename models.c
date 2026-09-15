@@ -292,10 +292,10 @@ static Vector3 far_ball_normals[20] EWRAM_MODEL_DATA;
 static Mesh far_ball_mesh = {"DISTANT_BALL",12,20,sphere_verts,far_ball_faces,far_ball_normals};
 
 const Mesh *car_gameplay_mesh(int model, int distance_sq) {
-    return distance_sq > 240*240 ? car_far_models[model] : car_match_models[model];
+    return performance_mode || distance_sq > 240*240 ? car_far_models[model] : car_match_models[model];
 }
 const Mesh *ball_gameplay_mesh(int distance_sq) {
-    return distance_sq > 260*260 ? &far_ball_mesh : &sphere_mesh;
+    return distance_sq > (280*280) ? &far_ball_mesh : &sphere_mesh;
 }
 
 void init_dynamic_models(void) {

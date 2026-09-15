@@ -67,6 +67,7 @@ typedef struct {
 extern u8 frame_buffer[240 * 160];
 extern u8 pitch_texture[512][256];
 extern u8 car_texture[64][64]; // UV editable car texture
+extern int performance_mode; /* 1=Fast match graphics, 0=Detailed */
 extern int active_pitch_mode; /* 0=soccer, 1=hockey */
 
 /* --- Look-Up Tables --- */
@@ -123,6 +124,7 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch);
 int project_vertex_world(Vector3 world_pos, int *sx, int *sy);
 void draw_world_line(Vector3 a, Vector3 b, u8 color);
 int world_sphere_visible(Vector3 pos, fixed radius);
+int world_bounds_visible(Vector3 lo, Vector3 hi);
 int world_target_indicator(Vector3 pos, int *sx, int *sy);
 
 /**

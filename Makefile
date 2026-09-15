@@ -27,7 +27,7 @@ GBAFIX  := $(DEVKITPRO)/tools/bin/gbafix
 TARGET  := gba_3d
 
 # Sources and Objects
-SOURCES := main.c engine3d.c render.c models.c stadium.c
+SOURCES := main.c engine3d.c render.c models.c stadium.c link.c
 OBJS    := $(SOURCES:.c=.o)
 
 # GBA ARM7TDMI Architecture compiler flags
@@ -63,6 +63,7 @@ $(TARGET).elf: $(OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 main.o stadium.o: stadium.h
+main.o link.o: link.h
 models.o: car_models.inc models.h engine3d.h
 main.o engine3d.o render.o stadium.o: engine3d.h render.h models.h
 

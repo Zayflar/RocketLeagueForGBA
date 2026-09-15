@@ -90,13 +90,22 @@ void clear_screen(u8 color) {
     memset32(frame_buffer, color32, (240 * RENDER_HEIGHT) / 4);
 }
 
+static volatile u32 video_frame;
+void video_vblank(void) { ++video_frame; }
+
 void swap_buffers(void) {
+    static u32 last_present_frame=0xffffffffu;
     u32 back_buffer = (REG_DISPCNT & DCNT_PAGE) ? 0x06000000 : 0x0600A000;
     
     REG_DMA3SAD = (u32)frame_buffer;
     REG_DMA3DAD = back_buffer;
     REG_DMA3CNT = ((240 * RENDER_HEIGHT) / 4) | DMA_ENABLE | DMA_32;
     
+    /* DMA writes only the hidden page. Finish it before waiting, and reuse
+       the current blanking interval when there is still room to flip safely. */
+    int scanline=REG_VCOUNT;
+    if(scanline<160 || scanline>225 || video_frame==last_present_frame) VBlankIntrWait();
+    last_present_frame=video_frame;
     REG_DISPCNT ^= DCNT_PAGE;
 }
 

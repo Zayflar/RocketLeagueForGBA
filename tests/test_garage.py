@@ -6,6 +6,10 @@ with tempfile.TemporaryDirectory() as tmp:
     d=Path(tmp)
     for name in ('engine3d.h','engine3d.c','render.h','render.c','models.h','models.c','car_models.inc','stadium.c','stadium.h'):
         s=(Path(os.environ['STADIUM_SOURCE']) if name=='stadium.c' and 'STADIUM_SOURCE' in os.environ else root/name).read_text()
+        if name=='engine3d.c':
+            s='long test_vertices,test_faces,test_projections;\n'+s
+            s=s.replace('int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {','int project_vertex_world(Vector3 world_pos, int *sx, int *sy) { ++test_projections;')
+            s=s.replace('    /* Reject unsupported meshes before transforming', '    if(mesh){test_vertices+=mesh->vertex_count;test_faces+=mesh->face_count;}\n    /* Reject unsupported meshes before transforming')
         if name=='engine3d.c' and os.environ.get('STADIUM_PROFILE'):
             s='long profile_project, profile_lines, profile_meshes;\n'+s
             s=s.replace('int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {', 'int project_vertex_world(Vector3 world_pos, int *sx, int *sy) { ++profile_project;')
@@ -17,6 +21,7 @@ with tempfile.TemporaryDirectory() as tmp:
 #include <stdint.h>
 #include <math.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+extern long test_vertices,test_faces,test_projections;
 extern u16 pal_bg_mem[256];
 extern u32 REG_DISPCNT, REG_BG2PA, REG_BG2PD, REG_BG2PB, REG_BG2PC, REG_BG2X, REG_BG2Y;
 extern u32 REG_DMA3SAD,REG_DMA3DAD,REG_DMA3CNT;
@@ -25,6 +30,8 @@ extern u32 REG_DMA3SAD,REG_DMA3DAD,REG_DMA3CNT;
 #define DCNT_PAGE 0
 #define DMA_ENABLE 0
 #define DMA_32 0
+#define REG_VCOUNT 160
+#define VBlankIntrWait() ((void)0)
 static inline int lu_sin(int a) { return lround(sin(a*6.283185307179586/65536)*4096); }
 static inline int lu_cos(int a) { return lround(cos(a*6.283185307179586/65536)*4096); }
 static inline void memcpy32(void *p,const void *s,int n) { u32 *q=p; const u32 *r=s; while(n--) *q++=*r++; }
@@ -40,12 +47,15 @@ static inline void memset32(void *p,u32 v,int n) { u32 *q=p; while(n--) *q++=v; 
     match_hud=main[main.index('static void draw_ball_indicator'):main.index('/* --- Main Application Frame logic')]
     pitch=main[main.index('static const Vector3 center_circle_pts'):main.index('/* Small floodlight')]
     radar=main[main.index('static void radar_point'):main.index('/* --- Big Minimap')]
-    pitch_constants='\n'.join(line for line in main.splitlines() if line.startswith(('#define STADIUM_', '#define CAGE_', '#define GOAL_HALF_WIDTH')))
+    pitch_constants='\n'.join(line for line in main.splitlines() if line.startswith(('#define STADIUM_', '#define CAGE_', '#define GOAL_HALF_WIDTH', '#define GOAL_HEIGHT')))
     car_code=main[main.index('typedef struct {\n    Vector3 pos;\n    Vector3 vel;'):main.index('\n\ntypedef struct {\n    Vector3 pos;\n    Vector3 vel;')]
     boost_code=main[main.index('static void apply_player_boost'):main.index('/* --- Physics Core Logic --- */')]
+    ball_physics=main[main.index('void update_ball_physics'):main.index('/* --- Sphere-to-Sphere Car-Ball Collision')]
+    collisions=main[main.index('/* --- Sphere-to-Sphere Car-Ball Collision --- */'):main.index('/* --- Fast Atan2')]
+    physics=main[main.index('void update_car_physics'):main.index('void update_ball_physics')]
     particle_code=main[main.index('typedef struct {',main.index('/* --- Particles --- */')):main.index('enum {',main.index('/* --- Particles --- */'))]
     particle_spawn=main[main.index('void spawn_boost_particle'):main.index('void spawn_skid_particle')]
-    constants='\n'.join(line for line in main.splitlines() if line.startswith(('#define FLIP_', '#define BOOST_ACCEL', '#define MAX_DRIVE_SPEED')))
+    constants='\n'.join(line for line in main.splitlines() if line.startswith(('#define FLIP_', '#define BOOST_ACCEL', '#define MAX_DRIVE_SPEED', '#define ACCEL_RATE', '#define GRAVITY', '#define DRAG_COEFF', '#define CAR_RADIUS', '#define BALL_RADIUS', '#define PUCK_', '#define JUMP_FORCE')))
     harness='''#include "models.h"
 #include "stadium.h"
 #include <stdlib.h>
@@ -68,14 +78,238 @@ static void save_preview(const char *name) {
 '''+state+hud+menus+'static int is_hockey_match;\n'+shadows+garage+constants+'\n'+car_code+particle_code+particle_spawn+'''
 static Car player,opponent;
 static int enable_opponent=1;
-static struct {Vector3 pos;} ball;
+static struct {Vector3 pos,vel;} ball;
 static int game_state, show_boost_alert;
-enum {STATE_TUTORIAL=99,STATE_REPLAY,STATE_TRAINING};
+enum {STATE_TUTORIAL=99,STATE_REPLAY,STATE_TRAINING,STATE_TRAINING_GOAL,STATE_GOAL};
+enum {TUTORIAL_AIM_SHOT=1};
+static int current_tutorial_stage,screen_shake;
+static struct {int objective;} tutorial_stages[1];
+static void spawn_explosion(Vector3 p,u8 c){}
+static void spawn_goal_celebration(Vector3 p,u8 c){}
+static int measured_fps=30;
 static int score_blue=2,score_orange=1,match_timer=3600,cam_mode,scoring_team=3,state_timer=100;
-static struct {int boosted;} tutorial_progress;
-'''+pitch_constants+'\n'+pitch+radar+boost_code+hud_text+match_hud+'''
+static struct {int boosted,goal_scored;} tutorial_progress;
+'''+pitch_constants+'\n'+pitch+radar+boost_code+physics+ball_physics+collisions+hud_text+match_hud+'''
 int main(void) {
     init_3d_engine(); init_dynamic_models(); init_mesh_normals();
+    performance_mode=0;
+    {
+        Car c={0};apply_air_rotation(&c,1,-1);
+        assert(c.visual_pitch==6 && c.visual_roll==244);
+        apply_air_rotation(&c,-1,1);assert(!c.visual_pitch && !c.visual_roll);
+        draw_achievements(2);save_preview("achievements.ppm");
+        assert(frame_buffer[70*240+12]==131);
+        int speeds[2];
+        for(int hockey=0;hockey<2;hockey++) {
+            is_hockey_match=hockey;
+            ball.pos=(Vector3){0,hockey?PUCK_HALF_HEIGHT:BALL_RADIUS,0};
+            ball.vel=(Vector3){0,0,8*256};
+            for(int i=0;i<20;i++)update_ball_physics();
+            speeds[hockey]=ball.vel.z;
+            assert(ball.pos.y==(hockey?PUCK_HALF_HEIGHT:BALL_RADIUS));
+        }
+        assert(speeds[1]>speeds[0]);
+        ball.pos=(Vector3){0,8*256,0};ball.vel=(Vector3){0,-3*256,0};
+        for(int i=0;i<5;i++)update_ball_physics();
+        assert(ball.pos.y==PUCK_HALF_HEIGHT && ball.vel.y==0);
+        c=(Car){0};c.speed=4*256;c.is_on_ground=1;
+        ball.pos=(Vector3){0,PUCK_HALF_HEIGHT,20*256};ball.vel=(Vector3){0,0,0};
+        assert(check_car_ball_collision(&c));assert(ball.vel.z>0 && ball.vel.y==0);
+        assert(ball.pos.y==PUCK_HALF_HEIGHT);
+        is_hockey_match=0;
+    }
+    /* Camera interpolation takes the short path, without overshoot or stalls. */
+    for(int start=0;start<256;start+=8)for(int target=0;target<256;target+=8) {
+        int heading=start;
+        for(int step=0;step<64;step++) {
+            int next=smooth_camera_heading(heading,target);
+            int delta=(next-heading)&255;if(delta>128)delta-=256;
+            assert(abs(delta)<=10);
+            int old=(target-heading)&255;if(old>128)old-=256;
+            int remaining=(target-next)&255;if(remaining>128)remaining-=256;
+            assert(abs(remaining)<=abs(old));heading=next;
+        }
+        assert(heading==target);
+    }
+    /* Holding jump extends lift; releasing it permanently ends this boost. */
+    {
+        int peak[2]={0,0};
+        for(int held=0;held<2;held++) {
+            Car c={0};c.is_on_ground=1;jump_from_surface(&c,(JUMP_FORCE*3)/5);
+            for(int i=0;i<100;i++) {
+                extend_jump(&c,held);update_car_physics(&c,0);
+                if(c.pos.y>peak[held])peak[held]=c.pos.y;
+            }
+            assert(c.is_on_ground);
+        }
+        assert(peak[1]>peak[0]);
+        Car c={0};c.is_on_ground=1;jump_from_surface(&c,3*256);
+        extend_jump(&c,0);fixed vy=c.vel.y;
+        extend_jump(&c,1);assert(c.vel.y==vy && c.jump_hold==0);
+    }
+    /* Surface changes preserve the impact attitude, including upside-down poses. */
+    for(int wall=-2;wall<=2;wall++)for(int pitch=0;pitch<256;pitch+=32)for(int roll=0;roll<256;roll+=32) {
+        Car c={0};c.yaw=32;c.visual_pitch=pitch;c.visual_roll=roll;
+        c.surface_wall=wall;c.surface_angle=wall?64:0;
+        int32_t before[9],after[9];build_car_rotation(&c,before);
+        retain_landing_rotation(&c,0,0);c.surface_wall=c.surface_angle=0;
+        build_car_rotation(&c,after);
+        for(int i=0;i<9;i++){if(abs(before[i]-after[i])>=300)fprintf(stderr,"wall %d pitch %d roll %d new %d %d %d matrix %d: %d / %d\\n",wall,pitch,roll,c.yaw,c.visual_pitch,c.visual_roll,i,before[i],after[i]);assert(abs(before[i]-after[i])<300);}
+    }
+    {
+        Car c={0};c.pos.y=80*256;c.visual_pitch=32;c.visual_roll=96;
+        for(int i=0;i<4;i++)update_car_physics(&c,0);
+        assert(c.visual_pitch==32 && c.visual_roll==96); /* no aerial auto-righting */
+        c.pos.y=256;c.vel.y=-2*256;update_car_physics(&c,0);
+        assert(c.is_on_ground && c.visual_pitch && c.visual_roll && c.settle_delay==4);
+        int pitch=c.visual_pitch,roll=c.visual_roll;
+        for(int i=0;i<4;i++)update_car_physics(&c,0);
+        assert(c.visual_pitch==pitch && c.visual_roll==roll);
+        update_car_physics(&c,0);
+        assert(abs(c.visual_pitch-pitch)<=3 && abs(c.visual_roll-roll)<=3);
+        for(int i=0;i<64;i++)update_car_physics(&c,0);
+        assert(c.visual_pitch==0 && c.visual_roll==0);
+        int peak[2]={0,0};
+        for(int stronger=0;stronger<2;stronger++) {
+            c=(Car){0};c.is_on_ground=1;
+            jump_from_surface(&c,stronger?(JUMP_FORCE*3)/5:3*256);
+            for(int i=0;i<100;i++) {update_car_physics(&c,0);if(c.pos.y>peak[stronger])peak[stronger]=c.pos.y;}
+            assert(c.is_on_ground);
+        }
+        assert(peak[1]>peak[0]*17/10);
+    }
+    /* Fast is the shipped default; detailed assets remain available in garage. */
+    int detail_faces=car_gameplay_mesh(0,100*100)->face_count;
+    performance_mode=1;
+    assert(car_gameplay_mesh(0,100*100)->face_count<detail_faces);
+    assert(ball_gameplay_mesh(100*100)->face_count==80);
+    assert(ball_gameplay_mesh(300*300)->face_count==20);
+    assert(ball_gameplay_mesh(60*60)->face_count==80);
+    long net_cost[2];
+    for(int mode=0;mode<2;mode++) {
+        performance_mode=mode;test_projections=0;
+        for(int yaw=0;yaw<256;yaw+=16) {
+            Vector3 camera={0,35*256,0};set_camera(camera,yaw,0);
+            draw_stadium_hex_walls(camera,STADIUM_WIDTH,STADIUM_LENGTH,STADIUM_HEIGHT);
+        }
+        net_cost[mode]=test_projections;
+    }
+    assert(net_cost[1]<net_cost[0]*3/5);
+    printf("NET PROJECTIONS: detailed %ld, fast %ld\\n",net_cost[0],net_cost[1]);
+    performance_mode=0;
+    /* Frustum boxes reject hidden geometry but retain visible and crossing edges. */
+    set_camera((Vector3){0,0,0},0,0);
+    assert(!world_bounds_visible((Vector3){-10*256,-10*256,-100*256},(Vector3){10*256,10*256,-50*256}));
+    assert(!world_bounds_visible((Vector3){300*256,0,50*256},(Vector3){310*256,10*256,60*256}));
+    assert(world_bounds_visible((Vector3){-20*256,-20*256,4*256},(Vector3){20*256,20*256,20*256}));
+    for(int yaw=0;yaw<256;yaw+=16) {
+        set_camera((Vector3){0,0,0},yaw,0);
+        for(int x=-500;x<=500;x+=50)for(int z=-500;z<=500;z+=50) {
+            Vector3 p={x*256,20*256,z*256};int px,py;
+            if(project_vertex_world(p,&px,&py) && px>=0 && px<240 && py>=0 && py<160)
+                assert(world_bounds_visible((Vector3){p.x-256,p.y-256,p.z-256},(Vector3){p.x+256,p.y+256,p.z+256}));
+        }
+    }
+    /* Far geometry halves face work and reduces transforms, even on cached draws. */
+    set_camera_lookat((Vector3){0,35*256,0},(Vector3){0,30*256,459*256},0);
+    test_vertices=test_faces=0;
+    draw_stadium_curves((Vector3){0,35*256,0},STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
+    assert(test_vertices>0 && test_vertices<=60 && test_faces<=48);
+    test_vertices=test_faces=0;
+    draw_stadium_curves((Vector3){STADIUM_WIDTH-64*256,35*256,0},STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
+    assert(test_vertices>0 && test_vertices<=68 && test_faces<=56);
+    /* Every garage effect animates, is distinct, and ends without residual pixels. */
+    unsigned fingerprints[3];
+    for(int style=0;style<3;style++) {
+        unsigned previous=0;
+        for(int age=10;age<=40;age+=30) {
+            clear_screen(2);draw_goal_effect(120,72,age,style,146,35);
+            unsigned hash=2166136261u;
+            for(int i=0;i<240*160;i++)hash=(hash^frame_buffer[i])*16777619u;
+            assert(age==10 || hash!=previous);previous=hash;
+        }
+        fingerprints[style]=previous;
+        char name[40];sprintf(name,"goal-effect-%d.ppm",style);save_preview(name);
+        garage_row=2;garage_goal[garage_side]=style;draw_garage();
+        sprintf(name,"garage-effect-%d.ppm",style);save_preview(name);
+        clear_screen(2);draw_goal_effect(120,72,96,style,146,35);
+        for(int i=0;i<240*160;i++)assert(frame_buffer[i]==2);
+    }
+    assert(fingerprints[0]!=fingerprints[1] && fingerprints[1]!=fingerprints[2] && fingerprints[0]!=fingerprints[2]);
+    garage_row=0;
+    /* Drive from flat ground through every ramp, jump out, and drive back down. */
+    for(int axis=1;axis<=2;axis++) for(int sign=-1;sign<=1;sign+=2) {
+        Car c={0};c.is_on_ground=1;c.can_double_jump=1;
+        c.yaw=axis==1?(sign>0?64:192):(sign>0?0:128);
+        if(axis==1)c.pos.x=sign*(STADIUM_WIDTH-WALL_CURVE_RADIUS-20*256);
+        else {c.pos.z=sign*(STADIUM_LENGTH-WALL_CURVE_RADIUS-20*256);c.pos.x=180*256;}
+        int climbed=0,saw_curve=0;
+        for(int frame=0;frame<240;frame++) {
+            c.speed+=ACCEL_RATE;if(c.speed>MAX_DRIVE_SPEED)c.speed=MAX_DRIVE_SPEED;
+            update_car_physics(&c,0);
+            assert(abs(c.pos.x)<=STADIUM_WIDTH && abs(c.pos.z)<=STADIUM_LENGTH);
+            if(c.surface_angle>0 && c.surface_angle<64)saw_curve=1;
+            if(c.pos.y>80*256) {climbed=1;break;}
+        }
+        assert(climbed && saw_curve && c.is_on_ground);
+        assert(c.surface_wall==axis*sign && c.surface_angle==64);
+        Car wall_car=c;
+        Vector3 normal=stadium_surface_vector((Vector3){0,256,0},c.surface_wall,c.surface_angle);
+        jump_from_surface(&c,3*256);
+        for(int frame=0;frame<5;frame++)update_car_physics(&c,0);
+        assert(!c.is_on_ground && c.can_double_jump);
+        fixed separation=FP_MUL(c.pos.x-wall_car.pos.x,normal.x)+FP_MUL(c.pos.z-wall_car.pos.z,normal.z);
+        assert(separation>8*256); /* jump leaves the wall, not just upward */
+        c=wall_car;
+        for(int frame=0;frame<150;frame++) {c.speed=-4*256;update_car_physics(&c,0);}
+        assert(c.pos.y==0 && c.is_on_ground && c.surface_angle==0);
+        /* Wall turbo adds tangent speed instead of detaching the car. */
+        player=wall_car;player.boost=50*256;player.boost_requested=1;
+        fixed old_speed=player.speed;
+        apply_player_boost();
+        assert(player.is_on_ground && player.speed>old_speed);
+    }
+    /* Both directions around every vertical corner retain forward travel. */
+    for(int sx=-1;sx<=1;sx+=2)for(int sz=-1;sz<=1;sz+=2)for(int from=1;from<=2;from++) {
+        Car c={0};c.is_on_ground=1;c.surface_angle=64;
+        c.surface_wall=from==1?sx:sz*2;
+        c.pos=(Vector3){sx*(STADIUM_WIDTH-(from==2?8*256:0)),80*256,
+            sz*(STADIUM_LENGTH-(from==1?8*256:0))};
+        c.yaw=from==1?(sz>0?0:128):(sx>0?64:192);
+        for(int frame=0;frame<16;frame++){c.speed=4*256;update_car_physics(&c,0);}
+        assert(c.surface_wall==(from==1?sz*2:sx));
+        assert(from==1?abs(c.pos.x)<STADIUM_WIDTH-20*256:abs(c.pos.z)<STADIUM_LENGTH-20*256);
+    }
+    /* A wall shot inherits upward driving speed; height separates cars. */
+    {
+        Car c={0};c.pos=(Vector3){STADIUM_WIDTH,80*256,0};
+        c.surface_wall=1;c.surface_angle=64;c.is_on_ground=1;c.yaw=64;c.speed=4*256;
+        ball.pos=(Vector3){STADIUM_WIDTH-10*256,100*256,0};ball.vel=(Vector3){0,0,0};
+        assert(check_car_ball_collision(&c));assert(ball.vel.y>0);
+        Car low={0},high={0};low.pos.x=high.pos.x=STADIUM_WIDTH;high.pos.y=100*256;
+        check_car_car_collision(&low,&high);
+        assert(low.pos.y==0 && high.pos.y==100*256);
+        high.pos.y=10*256;high.vel.y=-2*256;
+        check_car_car_collision(&low,&high);
+        assert(low.pos.y<0 && high.pos.y>10*256);
+    }
+    /* Goal mouths stay flat and traversable; above the opening is a wall. */
+    for(int sign=-1;sign<=1;sign+=2) {
+        Vector3 p={0,0,sign*(STADIUM_LENGTH+10*256)},normal;
+        int wall,angle;
+        stadium_surface_contact(&p,0,0,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,&wall,&angle,&normal);
+        assert(p.z==sign*(STADIUM_LENGTH+10*256) && wall==0);
+        p.y=GOAL_HEIGHT+10*256;
+        assert(stadium_surface_contact(&p,0,0,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,&wall,&angle,&normal));
+        assert(p.z==sign*STADIUM_LENGTH && angle==64);
+    }
+    /* A ball on the curve rests one radius inward from the wheel surface. */
+    {
+        Vector3 p={STADIUM_WIDTH-5*256,14*256,0},n;int w,a;
+        assert(stadium_surface_contact(&p,14*256,0,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,&w,&a,&n));
+        assert(p.y>14*256 && p.x<STADIUM_WIDTH-14*256 && n.x<0 && n.y>0);
+    }
+    player=(Car){0};
     /* Gameplay detail levels remain valid and reduce both transforms and faces. */
     for(int model=0;model<3;model++) {
         const Mesh *levels[3]={car_models[model],car_gameplay_mesh(model,100*100),car_gameplay_mesh(model,300*300)};
@@ -234,6 +468,18 @@ int main(void) {
         assert(frame_buffer[52*240+39]==goal_corner);
         if(!ice) save_preview("transparent-goal.ppm");
         if(!ice) {
+            {
+                Vector3 eye={180*256,70*256,-105*256};
+                set_camera_lookat(eye,(Vector3){300*256,36*256,0},0);
+                draw_environment_background(128);
+                draw_stadium_hex_walls(eye,STADIUM_WIDTH,STADIUM_LENGTH,STADIUM_HEIGHT);
+                draw_stadium_curves(eye,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
+                Car wall_car={0};wall_car.pos=(Vector3){STADIUM_WIDTH,52*256,0};
+                wall_car.yaw=64;wall_car.surface_wall=1;wall_car.surface_angle=64;
+                int32_t rot[9];build_car_rotation(&wall_car,rot);
+                draw_model_world_mat(car_gameplay_mesh(0,100*100),surface_car_position(0,&wall_car,rot),rot,256,6,RENDER_TEXTURED);
+                save_preview("wall-driving.ppm");
+            }
             set_camera_lookat((Vector3){-90*256,55*256,270*256},(Vector3){0,35*256,459*256},0);
             draw_environment_background(128);
             draw_stadium_goal(459*256,109*256,75*256,131);
@@ -243,7 +489,7 @@ int main(void) {
                 fast_draw_boost(charge,212,136);
                 assert(frame_buffer[146*240+212]==128); /* open center outside glyph */
                 assert(frame_buffer[155*240+193]==128); /* no rectangular backing */
-                assert(frame_buffer[115*240+212]==(charge>=75?131:149));
+                assert(frame_buffer[115*240+212]==(charge>=50?131:149));
                 char name[32];sprintf(name,"boost-%d.ppm",charge);save_preview(name);
             }
         }
@@ -300,7 +546,22 @@ int main(void) {
     int32_t identity[9]={4096,0,0,0,4096,0,0,0,4096};
     Mesh invalid=*car_models[0]; invalid.vertex_count=1;
     assert(draw_model_world_mat(&invalid,(Vector3){0,0,0},identity,256,3,5)==0);
-    puts("PASS: gameplay LODs, frustum culling, 18 loadouts, complete rotations, fixed car pivots, diagonal thrust/exhaust, stadium camera sweep, mesh/UV validity, invalid mesh rejection");
+    /* Compare both playable detail modes at the same camera and positions. */
+    for(int mode=0;mode<2;mode++) {
+        performance_mode=mode;active_pitch_mode=0;
+        Vector3 camera={0,35*256,-100*256};
+        set_camera_lookat(camera,(Vector3){0,15*256,0},0);
+        draw_environment_background(128);
+        draw_stadium_crowd(camera,CAGE_WIDTH,CAGE_LENGTH);
+        draw_soccer_pitch(camera);
+        draw_stadium_curves(camera,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
+        draw_stadium_goal(STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,131);
+        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,RENDER_TEXTURED);
+        draw_model_world(ball_gameplay_mesh(110*110),(Vector3){25*256,14*256,0},0,0,0,170,130,RENDER_FLAT);
+        player.boost=74*256;draw_match_hud();
+        save_preview(mode?"fast-mode.ppm":"detailed-mode.ppm");
+    }
+    puts("PASS: stronger jumps, preserved landing attitude, gradual recovery, three animated garage effects, reduced ramp LOD work, four-wall climbing/jumps/descent, corner traversal, goal clearance, wall boost, gameplay LODs, frustum culling, 18 loadouts, complete rotations, fixed car pivots, diagonal thrust/exhaust, stadium camera sweep, mesh/UV validity, invalid mesh rejection");
 }
 '''
     if os.environ.get('STADIUM_PROFILE'):

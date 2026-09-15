@@ -10,6 +10,7 @@
 #include "engine3d.h"
 #include "models.h"
 #include "stadium.h"
+#include "link.h"
 #include "coverart.h"
 
 /* --- Game State Definitions --- */
@@ -20,6 +21,8 @@ typedef enum {
     STATE_MENU_TRAINING,
     STATE_MENU_SETTINGS,
     STATE_MENU_GARAGE,
+    STATE_MENU_ACHIEVEMENTS,
+    STATE_MENU_LINK,
     STATE_PLAY,
     STATE_PAUSED,
     STATE_HOCKEY,
@@ -162,8 +165,14 @@ typedef struct {
     fixed boost;        // Boost meter (0 to 100 * FP_SCALE)
     int is_on_ground;
     int can_double_jump;
+    int surface_wall, surface_angle; /* signed axis and quarter-circle tilt */
+    int settle_pitch_velocity, settle_roll_velocity;
+    int jump_hold;
+    int settle_delay; /* hold the impact pose before gently righting */
+    int detach_timer; /* prevent a jump immediately reattaching */
     int team;           // 3 = Blue, 6 = Orange
     int boost_requested; /* consumed by physics after advancing the rotation */
+    int flip_base_pitch, flip_base_roll;
     int flip_timer;
     int flip_pitch_dir;
     int flip_roll_dir;
@@ -174,9 +183,126 @@ typedef struct {
 static void build_car_rotation(const Car *car, int32_t rotation[9]) {
     if (car->flip_timer > 0) {
         int angle = ((FLIP_DURATION_TICKS - car->flip_timer) * 256 / FLIP_DURATION_TICKS) & 255;
-        build_dodge_rotation(car->yaw, car->flip_pitch_dir, car->flip_roll_dir, angle, rotation);
+        if(car->flip_base_pitch || car->flip_base_roll) {
+            int32_t base[9],dodge[9];
+            build_model_rotation(car->yaw,car->flip_base_pitch,car->flip_base_roll,base);
+            build_dodge_rotation(0,car->flip_pitch_dir,car->flip_roll_dir,angle,dodge);
+            for(int row=0;row<3;row++)for(int col=0;col<3;col++)
+                rotation[row*3+col]=(base[row*3]*dodge[col]+base[row*3+1]*dodge[3+col]+base[row*3+2]*dodge[6+col])>>12;
+        } else build_dodge_rotation(car->yaw, car->flip_pitch_dir, car->flip_roll_dir, angle, rotation);
     } else {
         build_model_rotation(car->yaw, car->visual_pitch, car->visual_roll, rotation);
+    }
+    if(!car->surface_wall || !car->surface_angle) return;
+    for(int col=0;col<3;col++) {
+        Vector3 v={rotation[col],rotation[3+col],rotation[6+col]};
+        v=stadium_surface_vector(v,car->surface_wall,car->surface_angle);
+        rotation[col]=v.x;rotation[3+col]=v.y;rotation[6+col]=v.z;
+    }
+}
+
+/* Angle lookup only runs on touchdown, not every rendered frame. */
+static int landing_angle(int y, int x) {
+    if(!x && !y)return 0;
+    int best=-2147483647,angle=0;
+    for(int i=0;i<256;i++) {
+        int dot=x*custom_cos_lut[i]+y*custom_sin_lut[i];
+        if(dot>best){best=dot;angle=i;}
+    }
+    return angle;
+}
+
+static void retain_landing_rotation(Car *car,int wall,int angle) {
+    int32_t world[9],local[9];
+    build_car_rotation(car,world);
+    /* Express the current world attitude in the new support frame. */
+    for(int row=0;row<3;row++) {
+        Vector3 axis={row==0?256:0,row==1?256:0,row==2?256:0};
+        axis=stadium_surface_vector(axis,wall,angle);
+        for(int col=0;col<3;col++)
+            local[row*3+col]=(axis.x*world[col]+axis.y*world[3+col]+axis.z*world[6+col])/256;
+    }
+    int horizontal=fast_sqrt(local[3]*local[3]+local[4]*local[4]);
+    car->visual_pitch=landing_angle(-local[5],horizontal);
+    if(horizontal>64) {
+        car->yaw=landing_angle(local[2],local[8]);
+        car->visual_roll=landing_angle(local[3],local[4]);
+    } else if(local[5]<0) {
+        car->visual_roll=(car->yaw-landing_angle(local[1],local[0]))&255;
+    } else {
+        car->visual_roll=(landing_angle(-local[1],local[0])-car->yaw)&255;
+    }
+    car->flip_timer=0;
+    car->settle_delay=4;
+    car->settle_pitch_velocity=car->settle_roll_velocity=0;
+}
+
+static int settle_angle(int angle, int *velocity) {
+    int error=angle&255;if(error>128)error-=256;
+    if(error>=-1 && error<=1){*velocity=0;return 0;}
+    /* Damped angular spring: ease into recovery, then slow near upright. */
+    *velocity=(*velocity*3)/4-error*12;
+    if(*velocity>768)*velocity=768;
+    if(*velocity<-768)*velocity=-768;
+    int step=*velocity/256;
+    if(!step)step=error>0?-1:1;
+    if((error>0 && error+step<0)||(error<0 && error+step>0)) {
+        *velocity=0;return 0;
+    }
+    return (error+step)&255;
+}
+
+static int smooth_camera_heading(int current,int target) {
+    int delta=(target-current)&255;if(delta>128)delta-=256;
+    int step=delta/4;
+    if(!step && delta)step=delta>0?1:-1;
+    if(step>10)step=10;
+    if(step<-10)step=-10;
+    return (current+step)&255;
+}
+
+static void apply_air_rotation(Car *car,int pitch,int roll) {
+    car->visual_pitch=(car->visual_pitch+pitch*6)&255;
+    car->visual_roll=(car->visual_roll+roll*12)&255;
+}
+
+/* Rotate the standing pivot offset as well as the body. Wheel contact stays
+   on the surface, while aerial rotation remains centered on the actual car. */
+static Vector3 surface_car_position(int model, const Car *car, const int32_t rotation[9]) {
+    if(!car->surface_wall || !car->surface_angle)
+        return car_render_position(model,car->pos,car->yaw,rotation);
+    static const int32_t identity[9]={4096,0,0,0,4096,0,0,0,4096};
+    int32_t frame[9];
+    for(int col=0;col<3;col++) {
+        Vector3 v={identity[col],identity[3+col],identity[6+col]};
+        v=stadium_surface_vector(v,car->surface_wall,car->surface_angle);
+        frame[col]=v.x;frame[3+col]=v.y;frame[6+col]=v.z;
+    }
+    Vector3 baseline=car_render_position(model,(Vector3){0,0,0},car->yaw,identity);
+    Vector3 tilted=car_render_position(model,(Vector3){0,0,0},car->yaw,frame);
+    Vector3 shift=stadium_surface_vector(baseline,car->surface_wall,car->surface_angle);
+    Vector3 pos=car->pos;
+    pos.x+=shift.x-tilted.x;pos.y+=shift.y-tilted.y;pos.z+=shift.z-tilted.z;
+    return car_render_position(model,pos,car->yaw,rotation);
+}
+
+static void jump_from_surface(Car *car, fixed impulse) {
+    Vector3 normal=stadium_surface_vector((Vector3){0,256,0},car->surface_wall,car->surface_angle);
+    car->vel.x+=FP_MUL(normal.x,impulse);
+    car->vel.y+=FP_MUL(normal.y,impulse);
+    car->vel.z+=FP_MUL(normal.z,impulse);
+    car->detach_timer=6;
+    car->jump_hold=6;
+    car->is_on_ground=0;
+}
+
+/* A tap keeps the strong short hop; holding jump briefly extends the lift. */
+static void extend_jump(Car *car,int held) {
+    if(!held || car->is_on_ground){car->jump_hold=0;return;}
+    if(car->jump_hold>0) {
+        Vector3 lift=stadium_surface_vector((Vector3){0,FP_SCALE/5,0},car->surface_wall,car->surface_angle);
+        car->vel.x+=lift.x;car->vel.y+=lift.y;car->vel.z+=lift.z;
+        car->jump_hold--;
     }
 }
 
@@ -193,6 +319,7 @@ static Car opponent;
 static Ball ball;
 static int camera_yaw = 0;
 
+static int measured_fps = 0;
 static int score_blue = 0;
 static int score_orange = 0;
 static int match_timer = 120 * 60; // 2 minutes in frames (60 fps)
@@ -204,12 +331,23 @@ static int control_scheme = 0;     // 0 = Classic, 1 = Alternative
 static int screen_shake = 0;       // Screen shake duration counter
 static int show_boost_alert = 0;   // Frames to show "NO BOOST" warning
 static int cam_mode = 0;           // 0=Chase, 1=Front, 2=Ball-cam
+static int link_match,link_waiting,link_hockey;
+static u16 link_buttons[2],link_previous[2];
+static int control_override;
+static u16 control_down,control_hits;
+static int drive_down(int key){return control_override?(control_down&key):key_is_down(key);}
+static int drive_hit(int key){return control_override?(control_hits&key):key_hit(key);}
+
 static int is_hockey_match = 0;    // 1 = playing hockey, 0 = soccer
 /* Team identity stays blue/orange; cosmetic paint never changes scoring. */
 static int garage_side = 0;
 static int garage_row = 0;
 static int garage_model[2] = { 0, 1 };
 static int garage_paint[2] = { 0, 0 };
+static int garage_goal[2] = { 0, 1 };
+static const char *goal_effect_names[3]={"CONFETTI","NOVA","VORTEX"};
+static Vector3 goal_effect_pos;
+static int goal_effect_style;
 static const u8 team_paints[2][3] = { { 3, 5, 7 }, { 6, 1, 4 } };
 static const char *const team_paint_names[2][3] = {
     { "BLUE", "CYAN", "PURPLE" }, { "ORANGE", "RED", "GOLD" }
@@ -244,10 +382,13 @@ typedef struct {
     int opponent_yaw;
     int player_pitch;
     int player_roll;
+    u8 player_flip_base_pitch,player_flip_base_roll;
     u8 player_flip_timer;
     signed char player_flip_pitch_dir, player_flip_roll_dir;
     int opponent_pitch;
     int opponent_roll;
+    signed char player_wall, opponent_wall;
+    u8 player_surface_angle, opponent_surface_angle;
 } ReplayFrame;
 
 #define REPLAY_MAX_FRAMES 180
@@ -312,7 +453,7 @@ static void init_boost_pads(void) {
 #define CAGE_HEIGHT      ((STADIUM_HEIGHT * 110) / 100)
 
 #define GRAVITY          ((70 * 105 + 50) / 100) // +5%, rounded to nearest 8.8 unit
-#define JUMP_FORCE       (5 * FP_SCALE)
+#define JUMP_FORCE       (7 * FP_SCALE) // 40% stronger takeoff impulse
 #define MAX_DRIVE_SPEED  ((1232 * FP_SCALE) / 100) // 10% faster driving and boost cap
 #define ACCEL_RATE       (88)  // 10% quicker acceleration for both cars
 #define BOOST_ACCEL      (187) // Match the 10% increase in driving pace
@@ -320,6 +461,8 @@ static void init_boost_pads(void) {
 
 #define CAR_RADIUS       (13 * FP_SCALE)
 #define BALL_RADIUS      (14 * FP_SCALE)
+#define PUCK_RADIUS      (12 * FP_SCALE)
+#define PUCK_HALF_HEIGHT (4 * FP_SCALE)
 #define MIN_DIST_COLL    (25 * FP_SCALE) // Radius sum (13 + 12)
 
 /* --- Precomputed Center Circle Geometry (16 points, Radius 36 - Scaled 20%) --- */
@@ -385,9 +528,10 @@ void draw_soccer_pitch(Vector3 cam_pos) {
         }
     }
 
+    if(is_hockey_match)draw_hockey_markings(STADIUM_WIDTH,STADIUM_LENGTH);
     int cam_x = cam_pos.x;
     int cam_z = cam_pos.z;
-    draw_stadium_hex_walls(cam_pos, CAGE_WIDTH, CAGE_LENGTH, CAGE_HEIGHT);
+    draw_stadium_hex_walls(cam_pos, STADIUM_WIDTH, STADIUM_LENGTH, STADIUM_HEIGHT);
 
     // Vertical Pillars at corners
     Vector3 pillars[4] = { cage_corners[0], cage_corners[1], cage_corners[2], cage_corners[3] };
@@ -558,9 +702,9 @@ void draw_radar(void) {
     draw_line(6,126,38,126,13);
     draw_line(17,101,27,101,131); /* orange goal, forward up the map */
     draw_line(17,151,27,151,146);
-    radar_point(player.pos,146,1);
+    radar_point(player.pos,player.team==6?131:146,1);
     if(enable_opponent && game_state!=STATE_TRAINING && game_state!=STATE_TUTORIAL)
-        radar_point(opponent.pos,131,0);
+        radar_point(opponent.pos,opponent.team==6?131:146,0);
     radar_point(ball.pos,130,0);
 }
 
@@ -692,7 +836,7 @@ static void spawn_goal_celebration(Vector3 pos, u8 team_color) {
     int spawned = 0;
 
     /* A wide, upward spray reads as confetti instead of a flat particle pop. */
-    for (int i = 0; i < MAX_PARTICLES && spawned < 54; i++) {
+    for (int i = 0; i < MAX_PARTICLES && spawned < 32; i++) {
         if (particles[i].life <= 0) {
             particles[i].pos = pos;
             particles[i].pos.x += ((rand() % 121) - 60) * FP_SCALE / 2;
@@ -751,10 +895,13 @@ static void capture_replay_frame(void) {
     frame->player_pitch = player.visual_pitch;
     frame->player_roll = player.visual_roll;
     frame->player_flip_timer = player.flip_timer;
+    frame->player_flip_base_pitch=player.flip_base_pitch;frame->player_flip_base_roll=player.flip_base_roll;
     frame->player_flip_pitch_dir = player.flip_pitch_dir;
     frame->player_flip_roll_dir = player.flip_roll_dir;
     frame->opponent_pitch = opponent.visual_pitch;
     frame->opponent_roll = opponent.visual_roll;
+    frame->player_wall=player.surface_wall;frame->player_surface_angle=player.surface_angle;
+    frame->opponent_wall=opponent.surface_wall;frame->opponent_surface_angle=opponent.surface_angle;
 
     replay_write = (replay_write + 1) % REPLAY_MAX_FRAMES;
     if (replay_count < REPLAY_MAX_FRAMES) replay_count++;
@@ -795,10 +942,13 @@ static void advance_goal_replay(void) {
     player.visual_pitch = frame->player_pitch;
     player.visual_roll = frame->player_roll;
     player.flip_timer = frame->player_flip_timer;
+    player.flip_base_pitch=frame->player_flip_base_pitch;player.flip_base_roll=frame->player_flip_base_roll;
     player.flip_pitch_dir = frame->player_flip_pitch_dir;
     player.flip_roll_dir = frame->player_flip_roll_dir;
     opponent.visual_pitch = frame->opponent_pitch;
     opponent.visual_roll = frame->opponent_roll;
+    player.surface_wall=frame->player_wall;player.surface_angle=frame->player_surface_angle;
+    opponent.surface_wall=frame->opponent_wall;opponent.surface_angle=frame->opponent_surface_angle;
 
     replay_read = (replay_read + 1) % REPLAY_MAX_FRAMES;
     replay_remaining--;
@@ -816,6 +966,8 @@ void reset_kickoff(void) {
     player.speed = 0;
     player.boost = 34 * FP_SCALE; // Kickoff boost
     player.is_on_ground = 1;
+    player.surface_wall = player.surface_angle = player.detach_timer = player.settle_delay = 0;
+    player.jump_hold=player.settle_pitch_velocity=player.settle_roll_velocity=0;
     player.can_double_jump = 1;
     player.team = 3; // Blue team identity, independent of garage paint
     player.visual_pitch = 0;
@@ -832,6 +984,8 @@ void reset_kickoff(void) {
     opponent.speed = 0;
     opponent.boost = 34 * FP_SCALE;
     opponent.is_on_ground = 1;
+    opponent.surface_wall = opponent.surface_angle = opponent.detach_timer = opponent.settle_delay = 0;
+    opponent.jump_hold=opponent.settle_pitch_velocity=opponent.settle_roll_velocity=0;
     opponent.can_double_jump = 1;
     opponent.team = 6; // Orange override index
     opponent.visual_pitch = 0;
@@ -842,7 +996,7 @@ void reset_kickoff(void) {
     ball.pos.x = 0;
     ball.pos.z = 0;
     if (is_hockey_match) {
-        ball.pos.y = BALL_RADIUS;   // puck sits flat on ice
+        ball.pos.y = PUCK_HALF_HEIGHT;   // puck rests on its flat base
         ball.vel.x = 3 * FP_SCALE;  // small sideways nudge so it's live
         ball.vel.y = 0;
         ball.vel.z = 0;
@@ -886,6 +1040,8 @@ static void setup_tutorial_stage(void) {
     player.speed = 0;
     player.boost = 100 * FP_SCALE;
     player.is_on_ground = 1;
+    player.surface_wall = player.surface_angle = player.detach_timer = player.settle_delay = 0;
+    player.jump_hold=player.settle_pitch_velocity=player.settle_roll_velocity=0;
     player.can_double_jump = 1;
     player.team = 3;
     player.flip_timer = 0;
@@ -998,7 +1154,7 @@ static void apply_player_boost(void) {
             fixed push_y = FP_MUL(Fy, boost_accel);
             fixed push_z = FP_MUL(Fz, boost_accel);
 
-            if (push_y > 30 || (!player.is_on_ground && Fy > 10)) {
+            if ((!player.surface_wall && push_y > 30) || (!player.is_on_ground && Fy > 10)) {
                 player.is_on_ground = 0;
             }
 
@@ -1022,13 +1178,15 @@ static void apply_player_boost(void) {
             player.boost -= 310;
             if (player.boost < 0) player.boost = 0;
             /* Transform a rear exhaust point with the centered body transform. */
-            Vector3 exhaust = car_render_position(garage_model[0], player.pos, player.yaw, rotation);
+            Vector3 exhaust = surface_car_position(garage_model[player.team==6], &player, rotation);
             exhaust.x += (rotation[1] * 6 - rotation[2] * 20) / 16;
             exhaust.y += (rotation[4] * 6 - rotation[5] * 20) / 16;
             exhaust.z += (rotation[7] * 6 - rotation[8] * 20) / 16;
             spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
-            spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
-            spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+            if(!performance_mode) {
+                spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+                spawn_boost_particle(exhaust, (Vector3){Fx, Fy, Fz});
+            }
         } else {
             show_boost_alert = 45;
         }
@@ -1037,8 +1195,10 @@ static void apply_player_boost(void) {
 
 /* --- Physics Core Logic --- */
 void update_car_physics(Car *car, int is_player) {
-    fixed dir_x = custom_sin_fp[car->yaw & 255];
-    fixed dir_z = custom_cos_fp[car->yaw & 255];
+    Vector3 forward=stadium_surface_vector((Vector3){custom_sin_fp[car->yaw&255],0,
+        custom_cos_fp[car->yaw&255]},car->surface_wall,car->surface_angle);
+    fixed dir_x=forward.x, dir_y=forward.y, dir_z=forward.z;
+    if(car->detach_timer>0) car->detach_timer--;
 
     // Apply drag/friction to driving speed
     car->speed = (car->speed * DRAG_COEFF) >> 8;
@@ -1046,6 +1206,7 @@ void update_car_physics(Car *car, int is_player) {
     // When airborne, transfer ground speed into 3D velocity vector so speed doesn't pull car
     if (!car->is_on_ground && car->speed != 0) {
         car->vel.x += FP_MUL(dir_x, car->speed);
+        car->vel.y += FP_MUL(dir_y, car->speed);
         car->vel.z += FP_MUL(dir_z, car->speed);
         car->speed = 0;
     }
@@ -1057,6 +1218,10 @@ void update_car_physics(Car *car, int is_player) {
         int angle = ((FLIP_DURATION_TICKS - car->flip_timer) * 256 / FLIP_DURATION_TICKS) & 255;
         car->visual_pitch = (car->flip_pitch_dir * angle) & 255;
         car->visual_roll = (car->flip_roll_dir * angle) & 255;
+        if(!car->flip_timer) {
+            car->visual_pitch=car->flip_base_pitch;
+            car->visual_roll=car->flip_base_roll;
+        }
         
         // Gradual acceleration during flip
         fixed c_dir_x = custom_sin_fp[car->yaw & 255];
@@ -1079,11 +1244,22 @@ void update_car_physics(Car *car, int is_player) {
             ax = (ax * 181) / 256;
             az = (az * 181) / 256;
         }
-        car->vel.x += (ax * 16 * ticks) / FLIP_DURATION_TICKS;
-        car->vel.z += (az * 16 * ticks) / FLIP_DURATION_TICKS;
-    } else if (car->is_on_ground) {
-        car->visual_pitch = 0;
-        car->visual_roll = 0;
+        Vector3 impulse={ax,0,az};
+        if(car->flip_base_pitch || car->flip_base_roll) {
+            /* Keep dodge thrust in the same initial attitude as the flip. */
+            int sy=custom_sin_fp[car->yaw&255],cy=custom_cos_fp[car->yaw&255];
+            int sp=custom_sin_fp[car->flip_base_pitch&255],cp=custom_cos_fp[car->flip_base_pitch&255];
+            int sr=custom_sin_fp[car->flip_base_roll&255],cr=custom_cos_fp[car->flip_base_roll&255];
+            fixed lx=(cy*ax-sy*az)/256,lz=(sy*ax+cy*az)/256;
+            fixed x=lx*cr/256,y=lx*sr/256;
+            fixed z=(sp*y+cp*lz)/256;
+            impulse.y=(cp*y-sp*lz)/256;
+            impulse.x=(cy*x+sy*z)/256;impulse.z=(-sy*x+cy*z)/256;
+        }
+        impulse=stadium_surface_vector(impulse,car->surface_wall,car->surface_angle);
+        car->vel.x += (impulse.x * 16 * ticks) / FLIP_DURATION_TICKS;
+        car->vel.y += (impulse.y * 16 * ticks) / FLIP_DURATION_TICKS;
+        car->vel.z += (impulse.z * 16 * ticks) / FLIP_DURATION_TICKS;
     }
 
     // End flip animation
@@ -1092,7 +1268,7 @@ void update_car_physics(Car *car, int is_player) {
     // Translate position based on velocity vectors
     car->pos.x += FP_MUL(dir_x, car->speed) + car->vel.x;
     car->pos.z += FP_MUL(dir_z, car->speed) + car->vel.z;
-    car->pos.y += car->vel.y;
+    car->pos.y += FP_MUL(dir_y, car->speed) + car->vel.y;
 
     // Decay external impact velocities
     car->vel.x = (car->vel.x * 240) >> 8;
@@ -1103,15 +1279,50 @@ void update_car_physics(Car *car, int is_player) {
         car->vel.y -= GRAVITY;
     }
 
-    // Floor bounds check
-    if (car->pos.y <= 0) {
-        car->pos.y = 0;
-        if (car->vel.y < 0) car->vel.y = 0; // only stop downward motion on landing
-        car->is_on_ground = 1;
-        car->can_double_jump = 1;
-        if (car->flip_timer == 0 && !key_is_down(KEY_R)) {
-            car->visual_pitch = 0;
-            car->visual_roll = 0;
+    /* Resolve the same rounded cross-section that is drawn in the arena. */
+    int wall, angle;
+    Vector3 normal;
+    int attached=car->is_on_ground;
+    int contact=stadium_surface_contact(&car->pos,0,attached?2*FP_SCALE:0,
+        STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,&wall,&angle,&normal);
+    fixed inward=FP_MUL(car->vel.x,normal.x)+FP_MUL(car->vel.y,normal.y)+FP_MUL(car->vel.z,normal.z);
+    if(contact && !car->detach_timer && inward<=FP_SCALE) {
+        if(!attached || car->flip_timer>0) retain_landing_rotation(car,wall,angle);
+        else if(car->settle_delay>0) car->settle_delay--;
+        else {
+            car->visual_pitch=settle_angle(car->visual_pitch,&car->settle_pitch_velocity);
+            car->visual_roll=settle_angle(car->visual_roll,&car->settle_roll_velocity);
+        }
+        car->is_on_ground=1;
+        car->can_double_jump=1;
+        if(car->surface_wall && wall && car->surface_wall!=wall &&
+           car->surface_angle>32 && angle>32) {
+            int oldsign=car->surface_wall>0?1:-1, newsign=wall>0?1:-1;
+            int oldx=abs(car->surface_wall)==1, newx=abs(wall)==1;
+            fixed along=oldx?forward.z*oldsign:-forward.x*oldsign;
+            Vector3 turned={newx?0:-newsign*along,forward.y,newx?newsign*along:0};
+            int best=-2147483647;
+            for(int yaw=0;yaw<256;yaw++) {
+                Vector3 candidate=stadium_surface_vector((Vector3){custom_sin_fp[yaw],0,custom_cos_fp[yaw]},wall,angle);
+                int dot=candidate.x*turned.x+candidate.y*turned.y+candidate.z*turned.z;
+                if(dot>best){best=dot;car->yaw=yaw;}
+            }
+        }
+        car->surface_wall=wall;car->surface_angle=angle;
+        /* Grip cancels the normal force. A little tangential gravity lets an
+           idle car slide down, while normal throttle can still climb. */
+        if(wall) car->vel.y-=GRAVITY/4;
+        inward=FP_MUL(car->vel.x,normal.x)+FP_MUL(car->vel.y,normal.y)+FP_MUL(car->vel.z,normal.z);
+        car->vel.x-=FP_MUL(normal.x,inward);
+        car->vel.y-=FP_MUL(normal.y,inward);
+        car->vel.z-=FP_MUL(normal.z,inward);
+        car->vel.y=car->vel.y*240/256;
+    } else {
+        car->is_on_ground=0;
+        if(contact && inward<0) {
+            car->vel.x-=FP_MUL(normal.x,inward);
+            car->vel.y-=FP_MUL(normal.y,inward);
+            car->vel.z-=FP_MUL(normal.z,inward);
         }
     }
 
@@ -1126,46 +1337,18 @@ void update_car_physics(Car *car, int is_player) {
         car->boost += 25; // Slow charge on ground
     }
 
-    // Arena walls clamping
-    if (car->pos.x < -STADIUM_WIDTH) {
-        car->pos.x = -STADIUM_WIDTH;
-        car->vel.x = -car->vel.x / 2;
-    }
-    if (car->pos.x > STADIUM_WIDTH) {
-        car->pos.x = STADIUM_WIDTH;
-        car->vel.x = -car->vel.x / 2;
+    if(abs(car->pos.z)>STADIUM_LENGTH+35*FP_SCALE) {
+        car->pos.z=(car->pos.z<0?-1:1)*(STADIUM_LENGTH+35*FP_SCALE);
+        car->vel.z=0;
     }
 
-    // End-wall clamping (allow passage inside the goal bounds)
-    if (abs(car->pos.z) > STADIUM_LENGTH) {
-        // Goal boundaries
-        if (abs(car->pos.x) < GOAL_HALF_WIDTH && car->pos.y < GOAL_HEIGHT) {
-            // Keep inside the goal cage back-wall (35 units deep)
-            if (car->pos.z < -STADIUM_LENGTH - (35 * FP_SCALE)) {
-                car->pos.z = -STADIUM_LENGTH - (35 * FP_SCALE);
-                car->vel.z = 0;
-            }
-            if (car->pos.z > STADIUM_LENGTH + (35 * FP_SCALE)) {
-                car->pos.z = STADIUM_LENGTH + (35 * FP_SCALE);
-                car->vel.z = 0;
-            }
-        } else {
-            // Bounce/clamp back into stadium end-wall
-            if (car->pos.z < -STADIUM_LENGTH) {
-                car->pos.z = -STADIUM_LENGTH;
-                car->vel.z = -car->vel.z / 2;
-            }
-            if (car->pos.z > STADIUM_LENGTH) {
-                car->pos.z = STADIUM_LENGTH;
-                car->vel.z = -car->vel.z / 2;
-            }
-        }
-    }
 }
 
 void update_ball_physics(void) {
+    fixed radius=is_hockey_match?PUCK_RADIUS:BALL_RADIUS;
+    fixed half_height=is_hockey_match?PUCK_HALF_HEIGHT:BALL_RADIUS;
     // Gravity on ball (slower fall than cars)
-    if (ball.pos.y > BALL_RADIUS) {
+    if (ball.pos.y > half_height) {
         ball.vel.y -= GRAVITY / 2;
     }
 
@@ -1175,44 +1358,47 @@ void update_ball_physics(void) {
     ball.pos.z += ball.vel.z;
 
     // Drag
-    ball.vel.x = (ball.vel.x * 253) >> 8;
+    ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) >> 8;
     ball.vel.y = (ball.vel.y * 254) >> 8;
-    ball.vel.z = (ball.vel.z * 253) >> 8;
+    ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) >> 8;
 
     // 1. Floor collision
-    if (ball.pos.y <= BALL_RADIUS) {
-        ball.pos.y = BALL_RADIUS;
-        ball.vel.y = -ball.vel.y * 65 / 100; // Elasticity 0.65
-        ball.vel.x = (ball.vel.x * 253) >> 8; // Ground friction
-        ball.vel.z = (ball.vel.z * 253) >> 8;
+    if (ball.pos.y <= half_height) {
+        ball.pos.y = half_height;
+        ball.vel.y = ball.vel.y<0 ? -ball.vel.y*(is_hockey_match?18:65)/100 : ball.vel.y;
+        if(is_hockey_match && ball.vel.y<FP_SCALE)ball.vel.y=0;
+        ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) >> 8; // Ground friction
+        ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) >> 8;
     }
 
     // 2. Ceiling collision
-    if (ball.pos.y >= STADIUM_HEIGHT - BALL_RADIUS) {
-        ball.pos.y = STADIUM_HEIGHT - BALL_RADIUS;
+    if (ball.pos.y >= STADIUM_HEIGHT - half_height) {
+        ball.pos.y = STADIUM_HEIGHT - half_height;
         if (ball.vel.y > 0) ball.vel.y = -ball.vel.y * 65 / 100; // Bounce downward off ceiling
     }
 
-    // 2. Side walls collision
-    if (ball.pos.x <= -STADIUM_WIDTH + BALL_RADIUS) {
-        ball.pos.x = -STADIUM_WIDTH + BALL_RADIUS;
-        ball.vel.x = -ball.vel.x * 70 / 100;
-    }
-    if (ball.pos.x >= STADIUM_WIDTH - BALL_RADIUS) {
-        ball.pos.x = STADIUM_WIDTH - BALL_RADIUS;
-        ball.vel.x = -ball.vel.x * 70 / 100;
-    }
-
-    // 3. Ceiling collision
-    if (ball.pos.y >= STADIUM_HEIGHT - BALL_RADIUS) {
-        ball.pos.y = STADIUM_HEIGHT - BALL_RADIUS;
-        ball.vel.y = -ball.vel.y * 70 / 100;
+    /* The ball rolls/bounces off the same curved boundary as the cars. */
+    int wall,angle;
+    Vector3 normal;
+    Vector3 contact_pos=ball.pos;
+    contact_pos.y+=radius-half_height;
+    int touched=stadium_surface_contact(&contact_pos,radius,0,STADIUM_WIDTH,STADIUM_LENGTH,
+        GOAL_HALF_WIDTH,GOAL_HEIGHT+radius-half_height,&wall,&angle,&normal);
+    ball.pos=contact_pos;ball.pos.y-=radius-half_height;
+    if(touched && angle) {
+        fixed impact=FP_MUL(ball.vel.x,normal.x)+FP_MUL(ball.vel.y,normal.y)+FP_MUL(ball.vel.z,normal.z);
+        if(impact<0) {
+            impact=impact*170/100;
+            ball.vel.x-=FP_MUL(normal.x,impact);
+            ball.vel.y-=FP_MUL(normal.y,impact);
+            ball.vel.z-=FP_MUL(normal.z,impact);
+        }
     }
 
     // 4. Back walls / Goal line collision
-    if (abs(ball.pos.z) >= STADIUM_LENGTH - BALL_RADIUS) {
+    if (abs(ball.pos.z) >= STADIUM_LENGTH - radius) {
         // Goal zones check
-        if (abs(ball.pos.x) < GOAL_HALF_WIDTH - BALL_RADIUS && ball.pos.y < GOAL_HEIGHT - BALL_RADIUS) {
+        if (abs(ball.pos.x) < GOAL_HALF_WIDTH - radius && ball.pos.y < GOAL_HEIGHT - half_height) {
             if (game_state == STATE_TUTORIAL &&
                 tutorial_stages[current_tutorial_stage].objective == TUTORIAL_AIM_SHOT &&
                 ball.pos.z > STADIUM_LENGTH) {
@@ -1227,13 +1413,16 @@ void update_ball_physics(void) {
                        missed practice shot switch into match scoring. */
                     ball.pos.z = (ball.pos.z < 0)
                         ? -STADIUM_LENGTH + BALL_RADIUS
-                        : STADIUM_LENGTH - BALL_RADIUS;
+                        : STADIUM_LENGTH - radius;
                     ball.vel.z = -ball.vel.z * 70 / 100;
                 } else if (game_state == STATE_TRAINING) {
                     game_state = STATE_TRAINING_GOAL;
                     state_timer = 120;
                     screen_shake = 40;
-                    spawn_explosion(ball.pos, 129); // Cyan burst for training goal
+                    spawn_explosion(ball.pos, 129);
+                    scoring_team=3;
+                    goal_effect_pos=ball.pos;goal_effect_style=garage_goal[0];
+                    if(goal_effect_style==0)spawn_goal_celebration(ball.pos,3);
                 } else if (game_state != STATE_GOAL && game_state != STATE_TRAINING_GOAL) {
                     // Goal triggered!
                     scoring_team = (ball.pos.z > 0) ? 3 : 6; // Blue (Player) or Orange (AI)
@@ -1241,27 +1430,20 @@ void update_ball_physics(void) {
                     state_timer = 120; // 2 seconds replay
                     screen_shake = 40; // Explode shake
                     spawn_explosion(ball.pos, (scoring_team == 3) ? 129 : 131);
-                    spawn_goal_celebration(ball.pos, scoring_team);
+                    goal_effect_pos=ball.pos;
+                    goal_effect_style=garage_goal[scoring_team==3?0:1];
+                    if(goal_effect_style==0) spawn_goal_celebration(ball.pos, scoring_team);
                 }
             }
-        } else {
-            // Reflect off normal back wall
-            if (ball.pos.z <= -STADIUM_LENGTH + BALL_RADIUS) {
-                ball.pos.z = -STADIUM_LENGTH + BALL_RADIUS;
-                ball.vel.z = -ball.vel.z * 70 / 100;
-            }
-            if (ball.pos.z >= STADIUM_LENGTH - BALL_RADIUS) {
-                ball.pos.z = STADIUM_LENGTH - BALL_RADIUS;
-                ball.vel.z = -ball.vel.z * 70 / 100;
-            }
-        }
+        } /* Other end-wall contacts were resolved by the curved boundary. */
     }
 }
 
 /* --- Sphere-to-Sphere Car-Ball Collision --- */
 int check_car_ball_collision(Car *car) {
     fixed dx = ball.pos.x - car->pos.x;
-    fixed dy = ball.pos.y - car->pos.y;
+    int flat_hit=is_hockey_match && ball.pos.y<=PUCK_HALF_HEIGHT+FP_SCALE && car->pos.y<CAR_RADIUS;
+    fixed dy = flat_hit?0:ball.pos.y-car->pos.y;
     fixed dz = ball.pos.z - car->pos.z;
 
     // Shift to avoid overflow on standard GBA 32-bit registers
@@ -1270,7 +1452,7 @@ int check_car_ball_collision(Car *car) {
     fixed dz_s = dz >> 4;
 
     int32_t dist_sq_s = (dx_s * dx_s + dy_s * dy_s + dz_s * dz_s);
-    int32_t min_coll = CAR_RADIUS + BALL_RADIUS;
+    int32_t min_coll = CAR_RADIUS + (is_hockey_match?PUCK_RADIUS:BALL_RADIUS);
     int32_t min_coll_sq_s = (min_coll >> 4) * (min_coll >> 4);
 
     if (dist_sq_s < min_coll_sq_s) {
@@ -1289,11 +1471,11 @@ int check_car_ball_collision(Car *car) {
         ball.pos.z = car->pos.z + FP_MUL(nz, min_coll);
 
         // Convert car driving speed & velocity to world space vector
-        fixed dir_x = custom_sin_fp[car->yaw & 255];
-        fixed dir_z = custom_cos_fp[car->yaw & 255];
-
+        Vector3 direction=stadium_surface_vector((Vector3){custom_sin_fp[car->yaw&255],0,
+            custom_cos_fp[car->yaw&255]},car->surface_wall,car->surface_angle);
+        fixed dir_x=direction.x,dir_z=direction.z;
         fixed car_wx = FP_MUL(dir_x, car->speed) + car->vel.x;
-        fixed car_wy = car->vel.y;
+        fixed car_wy = FP_MUL(direction.y,car->speed)+car->vel.y;
         fixed car_wz = FP_MUL(dir_z, car->speed) + car->vel.z;
 
         // Relative velocity
@@ -1328,7 +1510,7 @@ int check_car_ball_collision(Car *car) {
             ball.vel.z += FP_MUL(j, nz);
             
             // "Pop" logic (aerial chips)
-            if (ny < 0) {
+            if (ny < 0 && !is_hockey_match) {
                 ball.vel.y -= ny * 2;
                 if (ball.vel.y < 3 * FP_SCALE) ball.vel.y = 3 * FP_SCALE;
             }
@@ -1351,6 +1533,7 @@ int check_car_ball_collision(Car *car) {
             car->vel.z -= nz * 2;
             car->speed = (car->speed * 200) >> 8; // lose a little speed on impact
         }
+        if(flat_hit){ball.pos.y=PUCK_HALF_HEIGHT;ball.vel.y=0;}
         return 1; // Touched
     }
     return 0; // No touch
@@ -1359,12 +1542,14 @@ int check_car_ball_collision(Car *car) {
 /* --- Car-to-Car Collision --- */
 void check_car_car_collision(Car *c1, Car *c2) {
     fixed dx = c2->pos.x - c1->pos.x;
+    fixed dy = c2->pos.y - c1->pos.y;
     fixed dz = c2->pos.z - c1->pos.z;
 
     fixed dx_s = dx >> 4;
+    fixed dy_s = dy >> 4;
     fixed dz_s = dz >> 4;
 
-    int32_t dist_sq_s = (dx_s * dx_s + dz_s * dz_s);
+    int32_t dist_sq_s = (dx_s * dx_s + dy_s * dy_s + dz_s * dz_s);
     int32_t min_coll   = 26 * FP_SCALE;
     int32_t min_coll_sq_s = (min_coll >> 4) * (min_coll >> 4);
 
@@ -1374,6 +1559,7 @@ void check_car_car_collision(Car *c1, Car *c2) {
 
         fixed inv_d = (dist_s < 2048) ? custom_div_lut[dist_s] : ((1 << 16) / dist_s);
         fixed nx = (dx_s * inv_d) >> 8;
+        fixed ny = (dy_s * inv_d) >> 8;
         fixed nz = (dz_s * inv_d) >> 8;
 
         fixed overlap = min_coll - (dist_s << 4);
@@ -1384,25 +1570,32 @@ void check_car_car_collision(Car *c1, Car *c2) {
         fixed sep = (overlap < max_sep) ? overlap : max_sep;
         fixed half_sep = sep >> 1;
         c1->pos.x -= FP_MUL(nx, half_sep);
+        c1->pos.y -= FP_MUL(ny, half_sep);
         c1->pos.z -= FP_MUL(nz, half_sep);
         c2->pos.x += FP_MUL(nx, half_sep);
+        c2->pos.y += FP_MUL(ny, half_sep);
         c2->pos.z += FP_MUL(nz, half_sep);
 
         /* World velocity vectors */
-        fixed c1_dir_x = custom_sin_fp[c1->yaw & 255];
-        fixed c1_dir_z = custom_cos_fp[c1->yaw & 255];
+        Vector3 c1_dir=stadium_surface_vector((Vector3){custom_sin_fp[c1->yaw&255],0,
+            custom_cos_fp[c1->yaw&255]},c1->surface_wall,c1->surface_angle);
+        fixed c1_dir_x=c1_dir.x,c1_dir_z=c1_dir.z;
+        fixed c1_wy=FP_MUL(c1_dir.y,c1->speed)+c1->vel.y;
         fixed c1_wx = FP_MUL(c1_dir_x, c1->speed) + c1->vel.x;
         fixed c1_wz = FP_MUL(c1_dir_z, c1->speed) + c1->vel.z;
 
-        fixed c2_dir_x = custom_sin_fp[c2->yaw & 255];
-        fixed c2_dir_z = custom_cos_fp[c2->yaw & 255];
+        Vector3 c2_dir=stadium_surface_vector((Vector3){custom_sin_fp[c2->yaw&255],0,
+            custom_cos_fp[c2->yaw&255]},c2->surface_wall,c2->surface_angle);
+        fixed c2_dir_x=c2_dir.x,c2_dir_z=c2_dir.z;
+        fixed c2_wy=FP_MUL(c2_dir.y,c2->speed)+c2->vel.y;
         fixed c2_wx = FP_MUL(c2_dir_x, c2->speed) + c2->vel.x;
         fixed c2_wz = FP_MUL(c2_dir_z, c2->speed) + c2->vel.z;
 
         /* Relative velocity along collision normal */
         fixed rvx = c2_wx - c1_wx;
+        fixed rvy = c2_wy - c1_wy;
         fixed rvz = c2_wz - c1_wz;
-        fixed vel_along_norm = (rvx * nx + rvz * nz) >> 8;
+        fixed vel_along_norm = (rvx * nx + rvy * ny + rvz * nz) >> 8;
 
         if (vel_along_norm < 0) {
             /* Base impulse from relative velocity (restitution 0.75) */
@@ -1410,18 +1603,21 @@ void check_car_car_collision(Car *c1, Car *c2) {
 
             /* Ram bonus: c1's forward speed along the normal adds extra
                push — the faster you hit, the harder the opponent flies  */
-            fixed c1_ram = (c1_wx * nx + c1_wz * nz) >> 8;
+            fixed c1_ram = (c1_wx * nx + c1_wy * ny + c1_wz * nz) >> 8;
             if (c1_ram > 0) {
                 impulse += (c1_ram * 55) / 100;
             }
 
             fixed imp_x = FP_MUL(impulse, nx);
+            fixed imp_y = FP_MUL(impulse, ny);
             fixed imp_z = FP_MUL(impulse, nz);
 
             /* Rammer barely recoils; victim takes most of the impulse */
             c1->vel.x -= (imp_x * 30) >> 8;  /* ~12% recoil to rammer */
+            c1->vel.y -= (imp_y * 30) >> 8;
             c1->vel.z -= (imp_z * 30) >> 8;
             c2->vel.x += (imp_x * 210) >> 8; /* ~82% push to victim   */
+            c2->vel.y += (imp_y * 210) >> 8;
             c2->vel.z += (imp_z * 210) >> 8;
 
             /* Speed reduction: rammer keeps most speed, victim brakes */
@@ -1472,6 +1668,16 @@ void update_ai_behavior(void) {
     fixed dx = ball.pos.x - opponent.pos.x;
     fixed dz = ball.pos.z - opponent.pos.z;
 
+    if(opponent.surface_wall) {
+        /* Inverse of the surface rotation: transpose applied to the target. */
+        Vector3 tx=stadium_surface_vector((Vector3){256,0,0},opponent.surface_wall,opponent.surface_angle);
+        Vector3 tz=stadium_surface_vector((Vector3){0,0,256},opponent.surface_wall,opponent.surface_angle);
+        fixed dy=ball.pos.y-opponent.pos.y;
+        fixed local_x=FP_MUL(dx,tx.x)+FP_MUL(dy,tx.y)+FP_MUL(dz,tx.z);
+        dz=FP_MUL(dx,tz.x)+FP_MUL(dy,tz.y)+FP_MUL(dz,tz.z);
+        dx=local_x;
+    }
+
     // AI car heading direction (LUT-based)
     fixed opp_dir_x = custom_sin_fp[opponent.yaw & 255];
     fixed opp_dir_z = custom_cos_fp[opponent.yaw & 255];
@@ -1516,8 +1722,7 @@ void update_ai_behavior(void) {
         if (ball.pos.y > (30 * FP_SCALE) && ball.pos.y < (100 * FP_SCALE)) {
             fixed dist_sq = (dx >> 4)*(dx >> 4) + (dz >> 4)*(dz >> 4);
             if (dist_sq < (60 * 60)) {
-                opponent.vel.y = (JUMP_FORCE * 3) / 5;
-                opponent.is_on_ground = 0;
+                jump_from_surface(&opponent,(JUMP_FORCE*3)/5);
             }
         }
     }
@@ -1634,6 +1839,7 @@ static void draw_match_hud(void) {
     if (boost_pct > 100) boost_pct = 100;
 
     draw_ball_indicator();
+    fast_draw_team_score("FPS",measured_fps,4,20,130);
     /* Transparent text with a one-pixel shadow keeps the arena visible. */
     fast_draw_team_score("BLU", score_blue, 40, 4, 146);
     fast_draw_time(match_timer / 60, 100, 4, 130);
@@ -1841,6 +2047,8 @@ static void draw_garage(void) {
     draw_model_world(car_models[garage_model[garage_side]], origin,
                      (spin++ / 3) & 255, 0, 0, FP_ONE,
                      team_paints[garage_side][garage_paint[garage_side]], RENDER_TEXTURED);
+    if(garage_row==2) draw_goal_effect(120,72,(spin%120)*96/120,
+        garage_goal[garage_side],garage_side?131:146,23);
     draw_centered_text_line("GARAGE", 5, 130);
     draw_centered_text_line(garage_side ? "L/R: ORANGE SIDE" : "L/R: BLUE SIDE", 21, accent);
     char label[30];
@@ -1852,14 +2060,40 @@ static void draw_garage(void) {
              team_paint_names[garage_side][garage_paint[garage_side]]);
     draw_hud_box(36, 122, 168, 12, garage_row == 1 ? 8 : 5, garage_row == 1 ? 131 : 10);
     draw_centered_text_line(label, 124, garage_row == 1 ? 131 : 130);
-    for (int i = 0; i < 3; ++i)
-        draw_line(99+i*16, 135, 109+i*16, 135, team_paints[garage_side][i]*16+12);
-    draw_centered_text_line("UP/DN:ROW  LEFT/RIGHT:EDIT", 141, 130);
-    draw_centered_text_line("A/B: DONE", 151, 130);
+    snprintf(label,sizeof(label),"%sGOAL: %s",garage_row==2?"- ":"  ",goal_effect_names[garage_goal[garage_side]]);
+    draw_hud_box(36,135,168,12,garage_row==2?8:5,garage_row==2?131:10);
+    draw_centered_text_line(label,137,garage_row==2?131:130);
+    draw_centered_text_line("ARROWS:EDIT  A/B:DONE",151,130);
+}
+
+static void draw_achievements(int selection) {
+    clear_screen(144);
+    draw_centered_text_line("ACHIEVEMENTS",8,130);
+    draw_centered_text_line("6 SLOTS TO DEFINE",23,146);
+    for(int i=0;i<6;i++) {
+        int x=12+(i%2)*116,y=40+(i/2)*30;
+        draw_hud_box(x,y,100,26,i==selection?145:5,i==selection?131:146);
+        char label[12];snprintf(label,sizeof(label),"SLOT %02d",i+1);
+        draw_string(label,x+20,y+3,i==selection?131:130);
+        draw_string("NOT SET",x+20,y+14,150);
+    }
+    draw_centered_text_line("ARROWS:SELECT  B:BACK",143,130);
 }
 
 static void draw_menu_screen(GameState state, int selection) {
     if (state == STATE_MENU_GARAGE) { draw_garage(); return; }
+    if (state == STATE_MENU_ACHIEVEMENTS) { draw_achievements(selection); return; }
+    if(state==STATE_MENU_LINK) {
+        clear_screen(144);
+        draw_centered_text_line("2 PLAYER LINK",14,130);
+        draw_centered_text_line(link_player_id()?"PLAYER 2 - ORANGE":"PLAYER 1 - BLUE",38,131);
+        draw_centered_text_line(link_hockey?"HOCKEY":"SOCCER",66,130);
+        draw_centered_text_line(link_waiting?"CONNECT BOTH CONSOLES":"LINK READY",90,146);
+        draw_centered_text_line("HOST: LEFT/RIGHT MODE",112,130);
+        draw_centered_text_line("HOST A: START  B:BACK",130,130);
+        draw_centered_text_line("START+SELECT: EXIT MATCH",147,150);
+        return;
+    }
     /* Artwork backdrop for the remaining menus. */
     memcpy32(frame_buffer, coverart_data, 38400 / 4);
 
@@ -1868,12 +2102,14 @@ static void draw_menu_screen(GameState state, int selection) {
         draw_fixed_width_menu_item("SETTINGS", 98, selection == 1);
         draw_fixed_width_menu_item("GARAGE",   114, selection == 2);
         draw_fixed_width_menu_item("TUTORIAL", 130, selection == 3);
+        draw_fixed_width_menu_item("ACHIEVEMENTS",146,selection==4);
     } else if (state == STATE_MENU_PLAY) {
         draw_centered_menu_text("PLAY", 38, 131);
         draw_centered_menu_item("SOCCER MATCH",  68, selection == 0);
         draw_centered_menu_item("HOCKEY MATCH",  84, selection == 1);
         draw_centered_menu_item("TRAINING",     100, selection == 2);
-        draw_centered_menu_item("BACK",         116, selection == 3);
+        draw_centered_menu_item("2 PLAYER LINK",116,selection==3);
+        draw_centered_menu_item("BACK",132,selection==4);
     } else if (state == STATE_MENU_TRAINING) {
         char level[20];
         draw_centered_menu_text("TRAINING", 38, 131);
@@ -1890,8 +2126,10 @@ static void draw_menu_screen(GameState state, int selection) {
         draw_centered_menu_item(value, 84, selection == 1);
         snprintf(value, sizeof(value), "CTRL: %s", control_scheme ? "ALT" : "CLASSIC");
         draw_centered_menu_item(value, 100, selection == 2);
-        draw_centered_menu_item("BACK", 116, selection == 3);
-        draw_centered_menu_text("LEFT RIGHT:CHANGE", 142, 129);
+        snprintf(value,sizeof(value),"GRAPHICS: %s",performance_mode?"FAST":"DETAILED");
+        draw_centered_menu_item(value,116,selection==3);
+        draw_centered_menu_item("BACK",132,selection==4);
+        draw_centered_menu_text("LEFT RIGHT:CHANGE", 150, 129);
 
     }
 }
@@ -1900,22 +2138,22 @@ static void handle_player_input(void) {
     int btn_accel, btn_reverse, btn_left, btn_right, btn_jump, btn_boost, btn_drift, btn_aerial_mod;
     
     if (control_scheme == 0) { // Classic
-        btn_accel = key_is_down(KEY_UP);
-        btn_reverse = key_is_down(KEY_DOWN);
-        btn_left = key_is_down(KEY_LEFT);
-        btn_right = key_is_down(KEY_RIGHT);
-        btn_jump = key_hit(KEY_A);
-        btn_boost = key_is_down(KEY_B);
-        btn_drift = key_is_down(KEY_L);
-        btn_aerial_mod = key_is_down(KEY_R);
+        btn_accel = drive_down(KEY_UP);
+        btn_reverse = drive_down(KEY_DOWN);
+        btn_left = drive_down(KEY_LEFT);
+        btn_right = drive_down(KEY_RIGHT);
+        btn_jump = drive_hit(KEY_A);
+        btn_boost = drive_down(KEY_B);
+        btn_drift = drive_down(KEY_L);
+        btn_aerial_mod = drive_down(KEY_R);
     } else { // Alternative
-        btn_accel = key_is_down(KEY_R);
-        btn_reverse = key_is_down(KEY_DOWN); // Using down for reverse
-        btn_left = key_is_down(KEY_LEFT);
-        btn_right = key_is_down(KEY_RIGHT);
-        btn_jump = key_hit(KEY_A);
-        btn_boost = key_is_down(KEY_B);
-        btn_drift = key_is_down(KEY_SELECT); // Using Select for drift since L is camera
+        btn_accel = drive_down(KEY_R);
+        btn_reverse = drive_down(KEY_DOWN); // Using down for reverse
+        btn_left = drive_down(KEY_LEFT);
+        btn_right = drive_down(KEY_RIGHT);
+        btn_jump = drive_hit(KEY_A);
+        btn_boost = drive_down(KEY_B);
+        btn_drift = drive_down(KEY_SELECT); // Using Select for drift since L is camera
         btn_aerial_mod = 1; // Always enabled in air
     }
 
@@ -1938,9 +2176,11 @@ static void handle_player_input(void) {
     }
 
     if (is_drifting && (btn_left || btn_right)) {
-        fixed right_x =  custom_cos_fp[player.yaw & 255];
-        fixed right_z = -custom_sin_fp[player.yaw & 255];
+        Vector3 right=stadium_surface_vector((Vector3){custom_cos_fp[player.yaw&255],0,
+            -custom_sin_fp[player.yaw&255]},player.surface_wall,player.surface_angle);
+        fixed right_x=right.x, right_z=right.z;
         fixed slide = (player.speed * 35) / 100;
+        player.vel.y += FP_MUL(right.y, slide);
         player.vel.x += FP_MUL(right_x, slide);
         player.vel.z += FP_MUL(right_z, slide);
         player.speed = (player.speed * 220) >> 8;
@@ -1959,8 +2199,10 @@ static void handle_player_input(void) {
 
     // Driving
     if (player.is_on_ground) {
+        int grip=(custom_cos_fp[player.visual_pitch&255]*custom_cos_fp[player.visual_roll&255])/256;
+        int acceleration=grip<128?ACCEL_RATE/4:ACCEL_RATE;
         if (btn_accel) {
-            player.speed += ACCEL_RATE;
+            player.speed += acceleration;
             if (player.speed > MAX_DRIVE_SPEED) player.speed = MAX_DRIVE_SPEED;
         } else if (btn_reverse) {
             if (player.speed > 0) {
@@ -1989,31 +2231,33 @@ static void handle_player_input(void) {
 
     /* Camera cycle is handled globally in the game loop via KEY_L hit */
 
-    // Aerial Pitch/Roll
+    // Aerial Pitch/Roll: 50% faster while the aerial modifier is held.
     if (btn_aerial_mod && !player.is_on_ground && player.flip_timer == 0 && !btn_jump) {
-        if (key_is_down(KEY_UP))    player.visual_pitch = (player.visual_pitch + 4) & 255;
-        if (key_is_down(KEY_DOWN))  player.visual_pitch = (player.visual_pitch - 4) & 255;
-        if (key_is_down(KEY_LEFT))  player.visual_roll  = (player.visual_roll  + 8) & 255;
-        if (key_is_down(KEY_RIGHT)) player.visual_roll  = (player.visual_roll  - 8) & 255;
+        int pitch=(drive_down(KEY_UP)?1:0)-(drive_down(KEY_DOWN)?1:0);
+        int roll=(drive_down(KEY_LEFT)?1:0)-(drive_down(KEY_RIGHT)?1:0);
+        apply_air_rotation(&player,pitch,roll);
     }
 
     // Jump / Dodge
+    extend_jump(&player,drive_down(KEY_A));
     if (btn_jump) {
         if (player.is_on_ground) {
             if (game_state == STATE_TUTORIAL) tutorial_progress.jumped = 1;
-            player.vel.y = (JUMP_FORCE * 3) / 5;
-            player.is_on_ground = 0;
+            jump_from_surface(&player,(JUMP_FORCE*3)/5);
         } else if (player.can_double_jump) {
             if (game_state == STATE_TUTORIAL) tutorial_progress.double_jumped = 1;
             player.can_double_jump = 0;
-            int is_forward = key_is_down(KEY_UP);
-            int is_back = key_is_down(KEY_DOWN);
-            int is_left = key_is_down(KEY_LEFT);
-            int is_right = key_is_down(KEY_RIGHT);
+            player.jump_hold=0;
+            int is_forward = drive_down(KEY_UP);
+            int is_back = drive_down(KEY_DOWN);
+            int is_left = drive_down(KEY_LEFT);
+            int is_right = drive_down(KEY_RIGHT);
 
             if (!is_forward && !is_back && !is_left && !is_right) {
                 player.vel.y = (JUMP_FORCE * 3) / 5;
             } else {
+                player.flip_base_pitch=player.visual_pitch;
+                player.flip_base_roll=player.visual_roll;
                 player.flip_timer = FLIP_DURATION_TICKS;
                 if (is_forward) player.flip_pitch_dir = 1;
                 else if (is_back) player.flip_pitch_dir = -1;
@@ -2033,6 +2277,31 @@ static void handle_player_input(void) {
 
 }
 
+static void update_link_car(int side) {
+    Car temp;
+    if(side){temp=player;player=opponent;opponent=temp;}
+    int saved_camera=camera_yaw,saved_scheme=control_scheme;
+    control_override=1;control_scheme=0;
+    control_down=link_buttons[side];control_hits=control_down&~link_previous[side];
+    handle_player_input();
+    update_car_physics(&player,1);
+    control_override=0;control_scheme=saved_scheme;
+    if(side!=link_player_id())camera_yaw=saved_camera;
+    if(side){temp=player;player=opponent;opponent=temp;}
+}
+
+static u16 link_local_buttons(void) {
+    u16 keys=key_curr_state();
+    if(control_scheme) {
+        const Car *local=link_player_id()?&opponent:&player;
+        keys&=~(KEY_R|KEY_L|KEY_SELECT|KEY_UP);
+        if((local->is_on_ground && key_is_down(KEY_R)) || key_is_down(KEY_UP))keys|=KEY_UP;
+        if(key_is_down(KEY_SELECT))keys|=KEY_L;
+        if(!local->is_on_ground)keys|=KEY_R;
+    }
+    return keys;
+}
+
 int main(void) {
     // Setup hardware Mode 4 and custom palettes
     init_3d_engine();          // Also calls init_pitch_texture() for soccer
@@ -2040,6 +2309,7 @@ int main(void) {
     init_mesh_normals();       // Precalculate face normals in model space
 
     irq_init(NULL);
+    irq_set(II_VBLANK, video_vblank, ISR_DEF);
     irq_enable(II_VBLANK);
     REG_DISPSTAT |= DSTAT_VBL_IRQ;
 
@@ -2047,6 +2317,7 @@ int main(void) {
     REG_TM0D = 0;
     REG_TM0CNT = 0x0083; // TM_ENABLE | TM_FREQ_1024
 
+    int ball_cam_yaw=0;
     int menu_selection = 0;
     int camera_shake_x = 0;
     int camera_shake_y = 0;
@@ -2060,14 +2331,30 @@ int main(void) {
         u16 current_tm0 = REG_TM0D;
         u16 dt_ticks = current_tm0 - last_tm0;
         last_tm0 = current_tm0;
+        static u32 fps_ticks=0, fps_frames=0;
+        fps_ticks+=dt_ticks;fps_frames++;
+        if(fps_ticks>=16384) {
+            measured_fps=(fps_frames*16384+fps_ticks/2)/fps_ticks;
+            if(measured_fps>99)measured_fps=99;
+            fps_ticks=0;fps_frames=0;
+        }
 
         static u32 timer_accumulator = 0;
         timer_accumulator += dt_ticks;
         int dt_time_frames = timer_accumulator / 273; // 16384 ticks / 60 frames = ~273 ticks per frame
         timer_accumulator %= 273;
 
+        int network_step=1;
+        if(link_match) {
+            if(key_is_down(KEY_START) && key_is_down(KEY_SELECT)) {
+                link_close();link_match=link_waiting=0;game_state=STATE_MENU_PLAY;menu_selection=3;
+            } else {
+                network_step=link_step(link_local_buttons(),dt_time_frames,link_buttons,&dt_time_frames);
+                link_waiting=!network_step;
+            }
+        }
         // 1. STATE MACHINE UPDATES
-        switch (game_state) {
+        if(network_step) switch (game_state) {
             case STATE_START_SCREEN:
                 if (key_hit(KEY_START) || key_hit(KEY_A)) {
                     game_state = STATE_TITLE;
@@ -2076,8 +2363,8 @@ int main(void) {
                 break;
 
             case STATE_TITLE:
-                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 3) % 4;
-                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 4;
+                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 4) % 5;
+                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 5;
 
                 /* A dedicated title-screen shortcut for the launcher click
                    adapter. It does not alter normal A/Start navigation. */
@@ -2097,13 +2384,23 @@ int main(void) {
                         game_state = STATE_MENU_GARAGE;
                     } else if (menu_selection == 3) {
                         start_tutorial_mode();
+                    } else if(menu_selection==4) {
+                        game_state=STATE_MENU_ACHIEVEMENTS;menu_selection=0;
                     }
                 }
                 break;
 
+            case STATE_MENU_ACHIEVEMENTS:
+                if(key_hit(KEY_LEFT))menu_selection=(menu_selection+5)%6;
+                if(key_hit(KEY_RIGHT))menu_selection=(menu_selection+1)%6;
+                if(key_hit(KEY_UP))menu_selection=(menu_selection+4)%6;
+                if(key_hit(KEY_DOWN))menu_selection=(menu_selection+2)%6;
+                if(key_hit(KEY_B)||key_hit(KEY_START)){game_state=STATE_TITLE;menu_selection=4;}
+                break;
+
             case STATE_MENU_PLAY:
-                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 3) % 4;
-                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 4;
+                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 4) % 5;
+                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 5;
                 
                 if (key_hit(KEY_B)) {
                     game_state = STATE_TITLE; menu_selection = 0;
@@ -2115,10 +2412,31 @@ int main(void) {
                     } else if (menu_selection == 2) {
                         game_state = STATE_MENU_TRAINING;
                     } else if (menu_selection == 3) {
+                        link_open();link_waiting=1;link_hockey=0;game_state=STATE_MENU_LINK;
+                    } else if(menu_selection==4) {
                         game_state = STATE_TITLE; menu_selection = 0;
                     }
                 }
                 break;
+
+            case STATE_MENU_LINK: {
+                if(key_hit(KEY_B)) {link_close();game_state=STATE_MENU_PLAY;menu_selection=3;break;}
+                if(!link_player_id() && (key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)))link_hockey^=1;
+                u16 values[2];
+                u16 request=link_hockey | ((!link_player_id() && key_is_down(KEY_A))?512:0);
+                link_waiting=!link_exchange(request,values);
+                if(!link_waiting) {
+                    link_hockey=values[0]&1;
+                    if(values[0]&512) {
+                        is_hockey_match=link_hockey;active_pitch_mode=link_hockey;
+                        enable_opponent=1;link_match=1;
+                        link_buttons[0]=link_buttons[1]=link_previous[0]=link_previous[1]=0;
+                        srand(1);reset_match();
+                        camera_yaw=link_player_id()?128:0;
+                    }
+                }
+                break;
+            }
 
             case STATE_MENU_TRAINING:
                 if (key_hit(KEY_LEFT)) {
@@ -2137,8 +2455,8 @@ int main(void) {
                 break;
 
             case STATE_MENU_SETTINGS:
-                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 3) % 4;
-                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 4;
+                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 4) % 5;
+                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 5;
                 
                 if (key_hit(KEY_B)) {
                     game_state = STATE_TITLE; menu_selection = 1;
@@ -2156,6 +2474,8 @@ int main(void) {
                         control_scheme = !control_scheme;
                     }
                 } else if (menu_selection == 3) {
+                    if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A)) performance_mode^=1;
+                } else if (menu_selection == 4) {
                     if (key_hit(KEY_A) || key_hit(KEY_START)) {
                         game_state = STATE_TITLE; menu_selection = 1;
                     }
@@ -2164,13 +2484,15 @@ int main(void) {
 
             case STATE_MENU_GARAGE:
                 if (key_hit(KEY_L) || key_hit(KEY_R)) garage_side ^= 1;
-                if (key_hit(KEY_UP) || key_hit(KEY_DOWN)) garage_row ^= 1;
+                if (key_hit(KEY_UP)) garage_row=(garage_row+2)%3;
+                if (key_hit(KEY_DOWN)) garage_row=(garage_row+1)%3;
                 if (key_hit(KEY_LEFT) || key_hit(KEY_RIGHT)) {
                     int step = key_hit(KEY_RIGHT) ? 1 : 2;
                     if (garage_row == 0)
                         garage_model[garage_side] = (garage_model[garage_side] + step) % CAR_MODEL_COUNT;
-                    else
+                    else if(garage_row==1)
                         garage_paint[garage_side] = (garage_paint[garage_side] + step) % 3;
+                    else garage_goal[garage_side]=(garage_goal[garage_side]+step)%3;
                 }
                 if (key_hit(KEY_B) || key_hit(KEY_A) || key_hit(KEY_START)) {
                     game_state = STATE_TITLE; menu_selection = 2;
@@ -2178,8 +2500,8 @@ int main(void) {
                 break;
                 
             case STATE_PLAY:
-                // Pause on START
-                if (key_hit(KEY_START)) {
+                // Pause on START (linked matches keep both simulations running).
+                if (!link_match && key_hit(KEY_START)) {
                     game_state = STATE_PAUSED;
                     pause_selection = 0;
                     break;
@@ -2194,24 +2516,18 @@ int main(void) {
                     }
                 }
 
-                handle_player_input();
+                if(!link_match)handle_player_input();
                 /* L button always cycles camera (both control schemes) */
                 if (key_hit(KEY_L)) cam_mode = (cam_mode + 1) % 2;
 
                 // Apply Physics Updates
-                update_car_physics(&player, 1);
-                if (enable_opponent) update_car_physics(&opponent, 0);
+                if(link_match){update_link_car(0);update_link_car(1);}
+                else {
+                    update_car_physics(&player, 1);
+                    if (enable_opponent) update_car_physics(&opponent, 0);
+                }
                 update_ball_physics();
                 capture_replay_frame();
-
-                /* When not holding R and not flipping, snap orientation back to neutral on ground */
-                int snap = 0;
-                if (control_scheme == 0) snap = !key_is_down(KEY_R);
-                else snap = 1;
-                if (player.is_on_ground && player.flip_timer == 0 && snap) {
-                    player.visual_pitch = 0;
-                    player.visual_roll  = 0;
-                }
 
                 // Collision interactions
                 check_car_ball_collision(&player);
@@ -2221,7 +2537,7 @@ int main(void) {
                 }
 
                 // AI Opponent steering action
-                if (enable_opponent) update_ai_behavior();
+                if (enable_opponent && !link_match) update_ai_behavior();
 
                 // ── Boost Pad logic ──────────────────────────────────────────
                 pad_pulse = (pad_pulse + 3) & 255;
@@ -2297,14 +2613,6 @@ int main(void) {
                 // Shared physics updates for solo modes (Tutorial & Training)
                 update_car_physics(&player, 1);
                 update_ball_physics();
-
-                int snap_t = 0;
-                if (control_scheme == 0) snap_t = !key_is_down(KEY_R);
-                else snap_t = 1;
-                if (player.is_on_ground && player.flip_timer == 0 && snap_t) {
-                    player.visual_pitch = 0;
-                    player.visual_roll  = 0;
-                }
 
                 static int touch_cooldown = 0;
                 if (check_car_ball_collision(&player)) {
@@ -2384,6 +2692,8 @@ int main(void) {
                 player.speed = 0;
                 player.boost = 34 * FP_SCALE;
                 player.is_on_ground = 1;
+                player.surface_wall = player.surface_angle = player.detach_timer = player.settle_delay = 0;
+                player.jump_hold=player.settle_pitch_velocity=player.settle_roll_velocity=0;
                 player.can_double_jump = 1;
                 player.team = 3;
                 player.visual_pitch = 0;
@@ -2441,7 +2751,7 @@ int main(void) {
                     if (match_timer <= 0) {
                         game_state = STATE_GAMEOVER;
                         state_timer = 240;
-                    } else if (!start_goal_replay()) {
+                    } else if (link_match || !start_goal_replay()) {
                         reset_kickoff();
                     }
                 }
@@ -2475,18 +2785,24 @@ int main(void) {
 
             case STATE_GAMEOVER:
                 state_timer -= dt_time_frames;
-                if (state_timer <= 0 && key_hit(KEY_START)) {
+                if (state_timer <= 0 && (link_match?(link_buttons[0]&KEY_START):key_hit(KEY_START))) {
                     reset_match();
                 }
                 break;
         }
+
+        if(link_match && network_step){link_previous[0]=link_buttons[0];link_previous[1]=link_buttons[1];}
+        /* Simulation always runs blue then orange. Only the presentation swaps
+           on console 2, so collisions and pad pickups have identical ordering. */
+        int swapped_view=link_match && link_player_id()==1;
+        if(swapped_view){Car tmp=player;player=opponent;opponent=tmp;}
 
         // 2. CAMERA CALCULATION
         Vector3 cam_pos;
         int cam_yaw = 0;
         int cam_pitch = 0;
 
-        if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_GARAGE)) {
+        if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_LINK)) {
             // Static beautiful camera for the menu
             cam_pos.x = -130 * FP_SCALE;
             cam_pos.z = -15 * FP_SCALE;
@@ -2507,6 +2823,7 @@ int main(void) {
                 cam_pos.y = ball.pos.y + 54 * FP_SCALE;
                 set_camera_lookat(cam_pos, focus, 0);
             } else if (cam_mode == 0) {
+                ball_cam_yaw=camera_yaw;
                 /* Pull back 10% so the entire car stays visible on approach. */
                 fixed c_dir_x = custom_sin_fp[camera_yaw & 255];
                 fixed c_dir_z = custom_cos_fp[camera_yaw & 255];
@@ -2515,22 +2832,32 @@ int main(void) {
                 cam_pos.y = player.pos.y + (31 * FP_SCALE);
                 cam_pitch = -11;
                 cam_yaw   = camera_yaw;
-                set_camera(cam_pos, cam_yaw, cam_pitch);
+                if(player.surface_wall && player.surface_angle>24) {
+                    Vector3 normal=stadium_surface_vector((Vector3){0,256,0},player.surface_wall,player.surface_angle);
+                    cam_pos.x+=normal.x*65;cam_pos.z+=normal.z*65;
+                    if(cam_pos.x>STADIUM_WIDTH-12*256)cam_pos.x=STADIUM_WIDTH-12*256;
+                    if(cam_pos.x<-STADIUM_WIDTH+12*256)cam_pos.x=-STADIUM_WIDTH+12*256;
+                    if(cam_pos.z>STADIUM_LENGTH-12*256)cam_pos.z=STADIUM_LENGTH-12*256;
+                    if(cam_pos.z<-STADIUM_LENGTH+12*256)cam_pos.z=-STADIUM_LENGTH+12*256;
+                    Vector3 target=player.pos;target.y+=8*256;
+                    set_camera_lookat(cam_pos,target,0);
+                } else set_camera(cam_pos, cam_yaw, cam_pitch);
             } else {
                 /* --- Improved Ball-cam ---
                  * Smoothly orbits behind the player while always looking at the ball.
                  * Uses an elastically-smoothed yaw so the camera never snaps.
                  * Height and distance dynamically adapt to ball altitude / distance.
                  */
-                static int ball_cam_yaw = 0;   /* smoothed angle, 0-255 */
+
 
                 /* Desired yaw = direction from player toward ball */
                 fixed dx_b = ball.pos.x - player.pos.x;
                 fixed dz_b = ball.pos.z - player.pos.z;
                 int target_yaw = fast_atan2(dx_b >> 8, dz_b >> 8);
 
-                /* Camera sits rigidly behind player along the vector to the ball */
-                ball_cam_yaw = target_yaw;
+                /* Avoid abrupt half-turns when the ball crosses the car. */
+                if(abs(dx_b)+abs(dz_b)>8*FP_SCALE)
+                    ball_cam_yaw=smooth_camera_heading(ball_cam_yaw,target_yaw);
 
                 fixed bdir_x = custom_sin_fp[ball_cam_yaw & 255];
                 fixed bdir_z = custom_cos_fp[ball_cam_yaw & 255];
@@ -2551,6 +2878,12 @@ int main(void) {
                 if (cam_h < 15) cam_h = 15;
                 cam_pos.y = player.pos.y + cam_h * FP_SCALE;
 
+                if(player.surface_wall && player.surface_angle>24) {
+                    if(cam_pos.x>STADIUM_WIDTH-12*256)cam_pos.x=STADIUM_WIDTH-12*256;
+                    if(cam_pos.x<-STADIUM_WIDTH+12*256)cam_pos.x=-STADIUM_WIDTH+12*256;
+                    if(cam_pos.z>STADIUM_LENGTH-12*256)cam_pos.z=STADIUM_LENGTH-12*256;
+                    if(cam_pos.z<-STADIUM_LENGTH+12*256)cam_pos.z=-STADIUM_LENGTH+12*256;
+                }
                 /* set_camera_lookat auto-computes pitch toward ball */
                 set_camera_lookat(cam_pos, ball.pos, 0);
             }
@@ -2566,7 +2899,7 @@ int main(void) {
             if ((timer_accumulator / 15) & 1) { 
                 draw_string("PRESS START TO PLAY", 50, 140, 130);
             }
-        } else if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_GARAGE)) {
+        } else if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_LINK)) {
             draw_menu_screen(game_state, menu_selection);
         } else {
             // Gameplay: sky + raycast ground seamlessly merged
@@ -2577,6 +2910,7 @@ int main(void) {
 
             // Draw 3D Soccer Pitch Lines
             draw_soccer_pitch(cam_pos);
+            draw_stadium_curves(cam_pos,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
             draw_stadium_floodlights();
 
             // Draw Shadows
@@ -2785,16 +3119,16 @@ int main(void) {
                 if (items[i].id == 0) {
                     int32_t mod_m[9];
                     build_car_rotation(&player, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[0], items[i].dist), car_render_position(garage_model[0], player.pos, player.yaw, mod_m), mod_m, FP_ONE, team_paints[0][garage_paint[0]], RENDER_TEXTURED);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[player.team==6], items[i].dist), surface_car_position(garage_model[player.team==6], &player, mod_m), mod_m, FP_ONE, team_paints[player.team==6][garage_paint[player.team==6]], RENDER_TEXTURED);
                 } else if (items[i].id == 1 && enable_opponent &&
                            game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
                     int32_t mod_m[9];
-                    build_model_rotation(opponent.yaw, opponent.visual_pitch, opponent.visual_roll, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[1], items[i].dist), car_render_position(garage_model[1], opponent.pos, opponent.yaw, mod_m), mod_m, FP_ONE, team_paints[1][garage_paint[1]], RENDER_TEXTURED);
+                    build_car_rotation(&opponent, mod_m);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[opponent.team==6], items[i].dist), surface_car_position(garage_model[opponent.team==6], &opponent, mod_m), mod_m, FP_ONE, team_paints[opponent.team==6][garage_paint[opponent.team==6]], RENDER_TEXTURED);
                 } else if (items[i].id == 2) {
                     if (is_hockey_match) {
-                        /* Hockey: draw puck (white flat cylinder) */
-                        draw_model_world(&puck_mesh, ball.pos, ball_spin_y, 0, 0, FP_SCALE, 0, RENDER_FLAT);
+                        /* Dark rubber puck contrasts with the ice. */
+                        draw_model_world(&puck_mesh, ball.pos, ball_spin_y, 0, 0, FP_SCALE, 149, RENDER_FLAT);
                     } else {
                         /* White ball material uses its dedicated diffuse ramp,
                            producing surface shadows plus a true-white highlight. */
@@ -2824,6 +3158,7 @@ int main(void) {
                 int speed_val = FP_TO_INT(abs(player.speed) * 35);
                 fast_draw_speed(speed_val, 62, 147, 130);
                 fast_draw_boost(FP_TO_INT(player.boost), 212, 136);
+                fast_draw_team_score("FPS",measured_fps,4,20,130);
             }
 
             // Mid-screen alerts (Y=72, centred) – only one shown at a time
@@ -2897,6 +3232,14 @@ int main(void) {
                 draw_string("GREAT SHOT!", 76, 60, 131);
             }
 
+            if(game_state==STATE_GOAL || game_state==STATE_TRAINING_GOAL) {
+                int gx,gy,tx,ty;
+                Vector3 tip=goal_effect_pos;tip.y+=30*FP_SCALE;
+                if(project_vertex_world(goal_effect_pos,&gx,&gy) && project_vertex_world(tip,&tx,&ty)) {
+                    int size=abs(ty-gy);if(size<12)size=12;if(size>60)size=60;
+                    draw_goal_effect(gx,gy,120-state_timer,goal_effect_style,scoring_team==3?146:131,size);
+                }
+            }
             if (game_state == STATE_GOAL) {
                 draw_goal_celebration_panel();
             } else if (game_state == STATE_REPLAY) {
@@ -2929,8 +3272,15 @@ int main(void) {
 
         }
 
+        if(link_match) {
+            draw_hud_text(link_player_id()?"P2 LINK":"P1 LINK",4,32,146);
+            if(link_waiting) {
+                draw_hud_text("WAITING FOR LINK",56,76,131);
+                draw_hud_text("START+SELECT: EXIT",44,92,130);
+            }
+        }
+        if(swapped_view){Car tmp=player;player=opponent;opponent=tmp;}
         // 4. SWAP AND SYNC
-        VBlankIntrWait();
         swap_buffers();
     }
 

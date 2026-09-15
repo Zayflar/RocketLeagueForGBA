@@ -8,6 +8,8 @@ source = (root / 'main.c').read_text()
 car = source[source.index('typedef struct {\n    Vector3 pos;\n    Vector3 vel;'):source.index('} Car;') + len('} Car;')]
 frames = '\n'.join(line for line in source.splitlines() if line.startswith('#define FLIP_'))
 update = source[source.index('    // Flip animation logic'):source.index('    // End flip animation')]
+surface=(root/'stadium.c').read_text()
+surface=surface[surface.index('Vector3 stadium_surface_vector'):surface.index('/* Exact integer square root')]
 harness = '''#include <stdint.h>
 #include <assert.h>
 #include <math.h>
@@ -15,7 +17,7 @@ harness = '''#include <stdint.h>
 typedef int32_t fixed;
 typedef struct { fixed x,y,z; } Vector3;
 int custom_sin_fp[256], custom_cos_fp[256];
-''' + frames + '\n' + car + '\nvoid step(Car *car) {\n' + update + '''
+''' + surface + frames + '\n' + car + '\nvoid step(Car *car) {\n' + update + '''
 }
 int main(void) {
     for(int i=0;i<256;i++) {
@@ -25,11 +27,11 @@ int main(void) {
     assert(FLIP_STEP_TICKS * 10 * 5 == FLIP_DURATION_TICKS * 6);
     int frames=(FLIP_DURATION_TICKS+FLIP_STEP_TICKS-1)/FLIP_STEP_TICKS;
     assert(frames==9);
-    for(int yaw=0;yaw<256;yaw+=16) {
+    for(int wall=-2;wall<=2;wall++) for(int yaw=0;yaw<256;yaw+=16) {
         double straight=0;
         for(int pitch=-1;pitch<=1;pitch++) for(int roll=-1;roll<=1;roll++) {
             if(!pitch && !roll) continue;
-            Car c={0}; c.yaw=yaw; c.flip_timer=FLIP_DURATION_TICKS;
+            Car c={0}; c.surface_wall=wall;c.surface_angle=wall?64:0; c.yaw=yaw; c.flip_timer=FLIP_DURATION_TICKS;
             c.flip_pitch_dir=pitch; c.flip_roll_dir=roll;
             for(int frame=1;frame<=frames;frame++) {
                 step(&c);
@@ -45,12 +47,18 @@ int main(void) {
             fixed vx=c.vel.x, vz=c.vel.z;
             step(&c);
             assert(c.vel.x==vx && c.vel.z==vz);
-            double speed=hypot(vx,vz);
+            double speed=sqrt((double)vx*vx+(double)c.vel.y*c.vel.y+(double)vz*vz);
             if(pitch==-1 && roll==0) straight=speed;
             if(straight) assert(fabs(speed-straight)<straight*0.02);
         }
     }
-    puts("PASS: faster full dodge rotation, neutral recovery, balanced directional impulse");
+    Car tilted={0};tilted.flip_timer=FLIP_DURATION_TICKS;
+    tilted.flip_pitch_dir=1;tilted.flip_roll_dir=1;
+    tilted.flip_base_pitch=40;tilted.flip_base_roll=96;
+    for(int i=0;i<frames;i++)step(&tilted);
+    assert(tilted.visual_pitch==40 && tilted.visual_roll==96);
+    step(&tilted);assert(tilted.visual_pitch==40 && tilted.visual_roll==96);
+    puts("PASS: faster full dodge rotation, neutral recovery, balanced directional impulse on floor and walls");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
