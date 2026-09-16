@@ -122,6 +122,7 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch);
  * @return 1 if point is in front of camera (renderable), 0 if behind (clipped).
  */
 int project_vertex_world(Vector3 world_pos, int *sx, int *sy);
+int draw_soccer_ball(Vector3 pos, int yaw, int pitch);
 void draw_world_line(Vector3 a, Vector3 b, u8 color);
 int world_sphere_visible(Vector3 pos, fixed radius);
 int world_bounds_visible(Vector3 lo, Vector3 hi);

@@ -157,6 +157,8 @@ IWRAM_CODE int32_t fast_sqrt(int32_t val) {
 
 /* --- Custom 8x8 Bitmap Font moved to render.c --- */
 
+#include "ball_sprite.inc"
+
 /* --- Camera state variables & Precomputed Matrix --- */
 static Vector3 camera_pos;
 static int32_t cam_cos_y, cam_sin_y;
@@ -250,6 +252,12 @@ void init_3d_engine(void) {
         pal_bg_mem[SKY_GRADIENT_START + i] = RGB5(
             5 + (17 * i + 7) / 15, 12 + (14 * i + 7) / 15,
             26 + (4 * i + 7) / 15);
+    }
+
+    /* Dedicated smooth white/cool-gray ramp for the spherical ball sprite. */
+    for (int i=0;i<32;i++) {
+        int shade=7+(24*i)/31;
+        pal_bg_mem[192+i]=RGB5(shade,shade,shade<30?shade+1:31);
     }
 
     // Pre-calculate Division LUT (1 / i) in 16.16 fixed point
@@ -897,6 +905,42 @@ IWRAM_CODE int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {
         return 1;
     }
     return 0;
+}
+
+/* Camera-facing sphere impostor, drawn in the same painter order as cars.
+ * Return 0 only for extreme close-ups, where the clipped mesh is safer.
+ * UV steps use integer additions; lighting and panel animation live in ROM. */
+int draw_soccer_ball(Vector3 pos, int yaw, int pitch) {
+    fixed rx=pos.x-camera_pos.x, ry=pos.y-camera_pos.y, rz=pos.z-camera_pos.z;
+    fixed x=(rx*cam_m00+rz*cam_m02)>>12;
+    fixed y=(rx*cam_m10+ry*cam_m11+rz*cam_m12)>>12;
+    fixed z=(rx*cam_m20+ry*cam_m21+rz*cam_m22)>>12;
+    if(z<=0) return 1;
+    if(z<28*FP_SCALE) return 0;
+    int sx,sy;
+    project_camera_point(x,y,z,&sx,&sy);
+    int radius=(14*FP_SCALE*120+z/2)/z;
+    if(radius<1) radius=1;
+    int left=sx-radius,top=sy-radius,diameter=radius*2;
+    int x0=left<0?0:left,y0=top<0?0:top;
+    int x1=left+diameter,y1=top+diameter;
+    if(x1>RENDER_WIDTH) x1=RENDER_WIDTH;
+    if(y1>RENDER_HEIGHT) y1=RENDER_HEIGHT;
+    if(x0>=x1 || y0>=y1) return 1;
+    const u8 *tex=ball_sprite[((yaw+pitch)&255)>>4];
+    int step=(64<<16)/diameter;
+    int v=(y0-top)*step+step/2;
+    for(int py=y0;py<y1;py++,v+=step) {
+        const u8 *row=tex+(v>>16)*64;
+        u8 *dst=frame_buffer+py*RENDER_WIDTH+x0;
+        int u=(x0-left)*step+step/2;
+        for(int px=x0;px<x1;px++,u+=step) {
+            u8 color=row[u>>16];
+            if(color) *dst=color;
+            dst++;
+        }
+    }
+    return 1;
 }
 
 /* --- Near-plane triangle clipping helper ---

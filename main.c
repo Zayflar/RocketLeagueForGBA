@@ -11,6 +11,7 @@
 #include "models.h"
 #include "stadium.h"
 #include "link.h"
+#include "achievements.h"
 #include "coverart.h"
 
 /* --- Game State Definitions --- */
@@ -1347,9 +1348,9 @@ void update_car_physics(Car *car, int is_player) {
 void update_ball_physics(void) {
     fixed radius=is_hockey_match?PUCK_RADIUS:BALL_RADIUS;
     fixed half_height=is_hockey_match?PUCK_HALF_HEIGHT:BALL_RADIUS;
-    // Gravity on ball (slower fall than cars)
+    // Soccer falls more decisively; retain the low, sliding hockey motion.
     if (ball.pos.y > half_height) {
-        ball.vel.y -= GRAVITY / 2;
+        ball.vel.y -= is_hockey_match ? GRAVITY/2 : GRAVITY*3/4;
     }
 
     // Position integration
@@ -1358,17 +1359,17 @@ void update_ball_physics(void) {
     ball.pos.z += ball.vel.z;
 
     // Drag
-    ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) >> 8;
-    ball.vel.y = (ball.vel.y * 254) >> 8;
-    ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) >> 8;
+    ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) / 256;
+    ball.vel.y = (ball.vel.y * 254) / 256;
+    ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) / 256;
 
     // 1. Floor collision
     if (ball.pos.y <= half_height) {
         ball.pos.y = half_height;
         ball.vel.y = ball.vel.y<0 ? -ball.vel.y*(is_hockey_match?18:65)/100 : ball.vel.y;
-        if(is_hockey_match && ball.vel.y<FP_SCALE)ball.vel.y=0;
-        ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) >> 8; // Ground friction
-        ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) >> 8;
+        if(ball.vel.y < (is_hockey_match?FP_SCALE:FP_SCALE/2)) ball.vel.y=0;
+        ball.vel.x = (ball.vel.x * (is_hockey_match?255:253)) / 256; // Ground friction
+        ball.vel.z = (ball.vel.z * (is_hockey_match?255:253)) / 256;
     }
 
     // 2. Ceiling collision
@@ -1440,6 +1441,19 @@ void update_ball_physics(void) {
 }
 
 /* --- Sphere-to-Sphere Car-Ball Collision --- */
+/* Exact integer root for contact normals and speed limits. The rendering
+   square-root LUT deliberately loses precision and can amplify impulses. */
+static int collision_sqrt(unsigned int value) {
+    unsigned int root=0,bit=1u<<30;
+    while(bit>value) bit>>=2;
+    while(bit) {
+        if(value>=root+bit) {value-=root+bit;root=(root>>1)+bit;}
+        else root>>=1;
+        bit>>=2;
+    }
+    return (int)root;
+}
+
 int check_car_ball_collision(Car *car) {
     fixed dx = ball.pos.x - car->pos.x;
     int flat_hit=is_hockey_match && ball.pos.y<=PUCK_HALF_HEIGHT+FP_SCALE && car->pos.y<CAR_RADIUS;
@@ -1456,7 +1470,7 @@ int check_car_ball_collision(Car *car) {
     int32_t min_coll_sq_s = (min_coll >> 4) * (min_coll >> 4);
 
     if (dist_sq_s < min_coll_sq_s) {
-        int32_t dist_s = fast_sqrt(dist_sq_s);
+        int32_t dist_s = collision_sqrt(dist_sq_s);
         if (dist_s == 0) dist_s = 1;
 
         // Calculate collision normals (8.8 format) using division LUT
@@ -1464,6 +1478,11 @@ int check_car_ball_collision(Car *car) {
         fixed nx = (dx_s * inv_d) >> 8;
         fixed ny = (dy_s * inv_d) >> 8;
         fixed nz = (dz_s * inv_d) >> 8;
+
+        /* Coincident centers need a defined contact normal as well. */
+        if (!dx_s && !dy_s && !dz_s) {
+            nx=custom_sin_fp[car->yaw&255];ny=0;nz=custom_cos_fp[car->yaw&255];
+        }
 
         // Push ball out of car penetration volume
         ball.pos.x = car->pos.x + FP_MUL(nx, min_coll);
@@ -1487,51 +1506,31 @@ int check_car_ball_collision(Car *car) {
         fixed vel_along_norm = (rvx * nx + rvy * ny + rvz * nz) >> 8;
 
         if (vel_along_norm < 0) {
-            // Apply impulse force (Restitution 1.25)
-            fixed impulse = -(125 * vel_along_norm) / 100;
-            
+            /* One impulse, with car:ball mass ratio 8:1 and restitution
+               0.35. Tangential velocity is untouched, so grazing contacts
+               redirect the ball without inventing extra forward energy. */
+            fixed impulse = (-vel_along_norm * 6) / 5;
             ball.vel.x += FP_MUL(impulse, nx);
             ball.vel.y += FP_MUL(impulse, ny);
             ball.vel.z += FP_MUL(impulse, nz);
 
-            // Add hit power based on car's speed and transfer some direct velocity
-            fixed hit_power = (car->speed > 0) ? (car->speed * 70 / 100) : 0;
-            
-            ball.vel.x += FP_MUL(nx, hit_power) + (car_wx * 35 / 100);
-            ball.vel.y += FP_MUL(ny, hit_power) + (car_wy * 35 / 100) + (car->is_on_ground ? 0 : FP_SCALE/2);
-            ball.vel.z += FP_MUL(nz, hit_power) + (car_wz * 35 / 100);
+            /* Equal/opposite reaction scaled by the heavier car's mass.
+               No fixed kickback or speed penalty on a feather-light touch. */
+            fixed reaction=impulse/8;
+            car->vel.x -= FP_MUL(reaction,nx);
+            car->vel.y -= FP_MUL(reaction,ny);
+            car->vel.z -= FP_MUL(reaction,nz);
 
-            // Apply bounce
-            fixed restitution = 80;
-            fixed j = FP_MUL(-(FP_SCALE + (restitution << 8)/100), vel_along_norm);
-            
-            ball.vel.x += FP_MUL(j, nx);
-            ball.vel.y += FP_MUL(j, ny);
-            ball.vel.z += FP_MUL(j, nz);
-            
-            // "Pop" logic (aerial chips)
-            if (ny < 0 && !is_hockey_match) {
-                ball.vel.y -= ny * 2;
-                if (ball.vel.y < 3 * FP_SCALE) ball.vel.y = 3 * FP_SCALE;
+            /* Cap total speed, not individual axes; diagonal hits must not
+               gain a sqrt(3) advantage. Apply after the complete impulse. */
+            int vx=ball.vel.x/16,vy=ball.vel.y/16,vz=ball.vel.z/16;
+            int speed=collision_sqrt(vx*vx+vy*vy+vz*vz)+2;
+            const int limit=22*FP_SCALE/16;
+            if(speed>limit) {
+                ball.vel.x=ball.vel.x*limit/speed;
+                ball.vel.y=ball.vel.y*limit/speed;
+                ball.vel.z=ball.vel.z*limit/speed;
             }
-            
-            // Cap ball velocity
-            fixed max_bvel = 25 * FP_SCALE;
-            if (ball.vel.x > max_bvel) ball.vel.x = max_bvel;
-            if (ball.vel.x < -max_bvel) ball.vel.x = -max_bvel;
-            if (ball.vel.z > max_bvel) ball.vel.z = max_bvel;
-            if (ball.vel.z < -max_bvel) ball.vel.z = -max_bvel;
-            if (ball.vel.y > max_bvel) ball.vel.y = max_bvel;
-            if (ball.vel.y < -max_bvel) ball.vel.y = -max_bvel;
-
-            // Inheritance
-            ball.vel.x += (car_wx * 35) / 100;
-            ball.vel.z += (car_wz * 35) / 100;
-
-            // Slightly push back car to simulate contact reaction
-            car->vel.x -= nx * 2;
-            car->vel.z -= nz * 2;
-            car->speed = (car->speed * 200) >> 8; // lose a little speed on impact
         }
         if(flat_hit){ball.pos.y=PUCK_HALF_HEIGHT;ball.vel.y=0;}
         return 1; // Touched
@@ -2067,17 +2066,44 @@ static void draw_garage(void) {
 }
 
 static void draw_achievements(int selection) {
+    /* Small code-native badges: ball, cup, puck, wall, graduation cap, flag.
+       Rank pips distinguish milestones within each family. */
+    static const unsigned short icons[6][12]={
+        {0x0f0,0x318,0x60c,0x466,0x8f1,0x8f1,0x8f1,0x466,0x60c,0x318,0x0f0,0},
+        {0x3fc,0x7fe,0x642,0x642,0x3fc,0x1f8,0x0f0,0x060,0x060,0x1f8,0x3fc,0},
+        {0,0,0x1f8,0x606,0x801,0xfff,0x801,0x801,0x606,0x1f8,0,0},
+        {0xfff,0x108,0x108,0xfff,0x421,0x421,0xfff,0x108,0x108,0xfff,0,0},
+        {0,0x060,0x1f8,0x7fe,0xfff,0x7fe,0x3fd,0x1f9,0x109,0x1f9,0x003,0},
+        {0x7fe,0x492,0x6da,0x492,0x7fe,0x400,0x400,0x400,0x400,0x400,0x400,0}
+    };
+    static const unsigned char family[ACH_COUNT]={0,0,1,2,3,4,0,0,0,1,1,1,2,2,3,3,3,5,5,5,0,2,1,1};
+    static const unsigned char rank[ACH_COUNT]={1,2,1,1,1,1,3,4,5,2,3,4,2,3,2,3,4,1,2,3,6,6,5,6};
     clear_screen(144);
-    draw_centered_text_line("ACHIEVEMENTS",8,130);
-    draw_centered_text_line("6 SLOTS TO DEFINE",23,146);
-    for(int i=0;i<6;i++) {
-        int x=12+(i%2)*116,y=40+(i/2)*30;
-        draw_hud_box(x,y,100,26,i==selection?145:5,i==selection?131:146);
-        char label[12];snprintf(label,sizeof(label),"SLOT %02d",i+1);
-        draw_string(label,x+20,y+3,i==selection?131:130);
-        draw_string("NOT SET",x+20,y+14,150);
+    draw_centered_text_line("ACHIEVEMENTS",3,130);
+    int unlocked=0;
+    for(int i=0;i<ACH_COUNT;i++)unlocked+=achievement_progress[i]>=achievement_targets[i];
+    char summary[24];snprintf(summary,sizeof(summary),"%d / 24 UNLOCKED",unlocked);
+    draw_centered_text_line(summary,15,146);
+    for(int i=0;i<ACH_COUNT;i++) {
+        int x=7+(i%6)*38,y=27+(i/6)*20;
+        int done=achievement_progress[i]>=achievement_targets[i];
+        draw_hud_box(x,y,35,19,i==selection?145:5,i==selection?131:done?146:150);
+        u8 color=done?131:i==selection?130:153;
+        for(int row=0;row<12;row++)for(int col=0;col<12;col++)
+            if(icons[family[i]][row]&(1u<<(11-col)))
+                frame_buffer[(y+2+row)*SCREEN_WIDTH+x+11+col]=color;
+        for(int r=0;r<rank[i];r++)draw_line(x+3+r*5,y+16,x+4+r*5,y+16,color);
+        if(done) {draw_line(x+28,y+4,x+30,y+6,146);draw_line(x+30,y+6,x+33,y+2,146);}
     }
-    draw_centered_text_line("ARROWS:SELECT  B:BACK",143,130);
+    draw_centered_text_line(achievement_names[selection],109,131);
+    draw_centered_text_line(achievement_descriptions[selection],122,130);
+    char progress[28];
+    int wall=selection==ACH_WALL || (selection>=ACH_WALL_15 && selection<=ACH_WALL_60);
+    if(achievement_progress[selection]>=achievement_targets[selection])snprintf(progress,sizeof(progress),"UNLOCKED");
+    else snprintf(progress,sizeof(progress),wall?"%u / %u SECONDS":"%u / %u",
+        achievement_progress[selection]/(wall?60:1),achievement_targets[selection]/(wall?60:1));
+    draw_centered_text_line(progress,134,146);
+    draw_centered_text_line("ARROWS:SELECT  B:BACK",149,130);
 }
 
 static void draw_link_lobby(int side,int hockey,int waiting) {
@@ -2305,6 +2331,7 @@ static u16 link_local_buttons(void) {
 
 int main(void) {
     // Setup hardware Mode 4 and custom palettes
+    achievements_init((volatile unsigned char *)0x0e000000);
     init_3d_engine();          // Also calls init_pitch_texture() for soccer
     init_dynamic_models();     // Initialize sphere and torus meshes
     init_mesh_normals();       // Precalculate face normals in model space
@@ -2318,6 +2345,7 @@ int main(void) {
     REG_TM0D = 0;
     REG_TM0CNT = 0x0083; // TM_ENABLE | TM_FREQ_1024
 
+    int achievement_toast=-1,achievement_toast_timer=0;
     int ball_cam_yaw=0;
     int menu_selection = 0;
     int camera_shake_x = 0;
@@ -2356,6 +2384,7 @@ int main(void) {
             }
         }
         // 1. STATE MACHINE UPDATES
+        int achievement_previous_state=game_state;
         if(network_step) switch (game_state) {
             case STATE_START_SCREEN:
                 if (key_hit(KEY_START) || key_hit(KEY_A)) {
@@ -2393,10 +2422,10 @@ int main(void) {
                 break;
 
             case STATE_MENU_ACHIEVEMENTS:
-                if(key_hit(KEY_LEFT))menu_selection=(menu_selection+5)%6;
-                if(key_hit(KEY_RIGHT))menu_selection=(menu_selection+1)%6;
-                if(key_hit(KEY_UP))menu_selection=(menu_selection+4)%6;
-                if(key_hit(KEY_DOWN))menu_selection=(menu_selection+2)%6;
+                if(key_hit(KEY_LEFT))menu_selection=(menu_selection/6)*6+(menu_selection%6+5)%6;
+                if(key_hit(KEY_RIGHT))menu_selection=(menu_selection/6)*6+(menu_selection%6+1)%6;
+                if(key_hit(KEY_UP))menu_selection=(menu_selection+18)%24;
+                if(key_hit(KEY_DOWN))menu_selection=(menu_selection+6)%24;
                 if(key_hit(KEY_B)||key_hit(KEY_START)){game_state=STATE_TITLE;menu_selection=4;}
                 break;
 
@@ -2794,6 +2823,32 @@ int main(void) {
                 break;
         }
 
+        if(network_step) {
+            int local_team=link_match && link_player_id()==1?6:3;
+            if(game_state==STATE_GOAL && achievement_previous_state==STATE_PLAY && scoring_team==local_team) {
+                achievement_add(ACH_GOAL,1);achievement_add(ACH_TEN_GOALS,1);
+                if(is_hockey_match)achievement_add(ACH_HOCKEY,1);
+            }
+            if(game_state==STATE_GAMEOVER && achievement_previous_state!=STATE_GAMEOVER) {
+                achievement_add(ACH_MATCH,1);
+                if(local_team==3?score_blue>score_orange:score_orange>score_blue) {
+                    achievement_add(ACH_WIN,1);
+                    achievement_add(is_hockey_match?ACH_HOCKEY_WIN:ACH_SOCCER_WIN,1);
+                    if(link_match)achievement_add(ACH_LINK_WIN,1);
+                    if((local_team==3?score_orange:score_blue)==0)achievement_add(ACH_SHUTOUT,1);
+                }
+            }
+            if(game_state==STATE_TUTORIAL_COMPLETE && achievement_previous_state!=STATE_TUTORIAL_COMPLETE)
+                achievement_add(ACH_TUTORIAL,1);
+            const Car *local=local_team==3?&player:&opponent;
+            if(achievement_previous_state==STATE_PLAY && local->is_on_ground && local->surface_wall &&
+               local->surface_angle>=48 && abs(local->speed)>FP_SCALE)achievement_add(ACH_WALL,dt_time_frames);
+        }
+        if(achievement_toast_timer>0)achievement_toast_timer-=dt_time_frames;
+        if(achievement_toast_timer<=0) {
+            achievement_toast=achievement_next_unlock();
+            if(achievement_toast>=0)achievement_toast_timer=150;
+        }
         if(link_match && network_step){link_previous[0]=link_buttons[0];link_previous[1]=link_buttons[1];}
         /* Simulation always runs blue then orange. Only the presentation swaps
            on console 2, so collisions and pad pickups have identical ordering. */
@@ -3133,10 +3188,9 @@ int main(void) {
                         /* Dark rubber puck contrasts with the ice. */
                         draw_model_world(&puck_mesh, ball.pos, ball_spin_y, 0, 0, FP_SCALE, 149, RENDER_FLAT);
                     } else {
-                        /* White ball material uses its dedicated diffuse ramp,
-                           producing surface shadows plus a true-white highlight. */
-                        draw_model_world(ball_gameplay_mesh(items[i].dist), ball.pos, ball_spin_y, ball_spin_x, 0,
-                                         FP_SCALE / 3 * 2, 130, RENDER_FLAT);
+                        if (!draw_soccer_ball(ball.pos, ball_spin_y, ball_spin_x))
+                            draw_model_world(ball_gameplay_mesh(items[i].dist), ball.pos, ball_spin_y, ball_spin_x, 0,
+                                             FP_SCALE / 3 * 2, 130, RENDER_FLAT);
                     }
                 }
             }
@@ -3273,6 +3327,11 @@ int main(void) {
                 draw_string("A:SEL  B:RESUME", 64, 104, 130);
             }
 
+        }
+
+        if(achievement_toast_timer>0 && achievement_toast>=0) {
+            draw_centered_text_line("ACHIEVEMENT UNLOCKED",112,131);
+            draw_centered_text_line(achievement_names[achievement_toast],124,130);
         }
 
         if(link_match) {

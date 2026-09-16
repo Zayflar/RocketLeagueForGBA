@@ -124,9 +124,26 @@ on the results screen. Garage appearance selections remain local to each ROM ses
 The protocol has automated two-peer tests with delayed, missing, and corrupted
 packets. A physical two-GBA / linked-emulator playtest is still required.
 
-## New controls and placeholders
+## Controls and achievements
 
 Holding R for aerial control rotates pitch and roll 50% faster. The hockey puck
 slides with less drag, rests at its actual half-height, and has a low ice bounce.
-Achievements opens six selectable, undefined slots; no objectives or unlock rules
-have been assigned yet.
+Achievements is a six-column, four-row icon grid with 24 unlockable challenges.
+Use the arrows to select an icon; its name, objective, and progress appear below.
+Unlocked icons gain a gold color and check mark. Rank pips distinguish milestones.
+
+The challenges include 1/10/25/50/100 goals, 1/5/10/25 wins, 1/10/25 hockey goals,
+3/15/30/60 seconds of wall driving, completing the tutorial, finishing 1/10/50
+matches, winning soccer/hockey/link matches, and winning without conceding.
+Goals and wins count in matches, including linked matches for your local team;
+training and replays do not count. Unlock notifications appear during play.
+Progress saves automatically to SRAM with an interrupted-write recovery copy.
+Existing six-achievement saves migrate automatically, including their recorded
+progress toward the new tiers. Wall progress saves every half-second. Keep your
+emulator's `.sav` file alongside the ROM to retain progress between sessions.
+
+The soccer ball uses a smoothly shaded spherical sprite with 16 animated panel
+frames at normal camera distances. The precomputed 64×64 frames stay in ROM,
+with no added mesh faces or persistent RAM buffer. Extreme close-ups retain the
+near-plane-clipped mesh; physics and hockey rendering are unchanged. Regenerate
+the sprite data with `python3 tools/gen_ball_sprite.py`.
