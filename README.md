@@ -104,3 +104,29 @@ Run `python3 tests/test_garage.py` to check all 18 loadouts over full rotations
 with AddressSanitizer/UndefinedBehaviorSanitizer. Set `GARAGE_PREVIEW_DIR` to
 retain PPM screenshots. This host test executes the production showroom and
 renderer with hardware register stubs; it does not measure GBA frame rate.
+
+
+## Two-player GBA link mode
+
+Choose **Play → 2 Player Link** on both consoles running the same ROM build.
+Connect a GBA multiplayer link cable, or use two linked instances of an emulator
+that implements GBA multiplayer serial communication. The cable host is blue
+(Player 1); the other console is orange (Player 2). Only two consoles are supported.
+The host chooses Soccer/Hockey with Left/Right, then presses A to start once both
+screens say **LINK READY**. Each player uses their own controls and camera.
+
+Input packets and the host's match-clock increments are synchronized. An interrupted
+connection freezes simulation and displays **WAITING FOR LINK**. Press Start+Select
+on either console to leave its match; the other player can use the same combination.
+Linked games skip goal replays and local pause; the host starts a rematch with Start
+on the results screen. Garage appearance selections remain local to each ROM session.
+
+The protocol has automated two-peer tests with delayed, missing, and corrupted
+packets. A physical two-GBA / linked-emulator playtest is still required.
+
+## New controls and placeholders
+
+Holding R for aerial control rotates pitch and roll 50% faster. The hockey puck
+slides with less drag, rests at its actual half-height, and has a low ice bounce.
+Achievements opens six selectable, undefined slots; no objectives or unlock rules
+have been assigned yet.

@@ -4,7 +4,7 @@
    Serial IRQ captures packets even while the peer is rendering a frame. */
 static volatile u16 received[2];
 static volatile unsigned expected,ready;
-static unsigned pending,phase,have_last;
+static unsigned pending,phase,have_last,retry;
 static u16 pending_packet,last_packet;
 static u16 step_buttons[2];
 
@@ -17,7 +17,7 @@ static void link_receive(void) {
     ready=1;
 }
 void link_open(void) {
-    expected=ready=pending=phase=have_last=0;
+    expected=ready=pending=phase=have_last=retry=0;
     REG_RCNT=0;
     REG_SIOCNT=SIO_MODE_MULTI|SIOM_115200|SIO_IRQ;
     REG_SIOMLT_SEND=0x8100;
@@ -27,7 +27,7 @@ void link_open(void) {
 void link_close(void) {
     irq_disable(II_SERIAL);
     REG_SIOCNT=0;REG_RCNT=0;
-    expected=ready=pending=phase=have_last=0;
+    expected=ready=pending=phase=have_last=retry=0;
 }
 int link_player_id(void) {return (REG_SIOCNT&SIOM_ID_MASK)>>SIOM_ID_SHIFT;}
 int link_exchange(u16 payload,u16 values[2]) {
@@ -40,13 +40,16 @@ int link_exchange(u16 payload,u16 values[2]) {
     while(!ready) {
         u16 status=REG_SIOCNT;
         if(!(status&SIOM_CONNECTED) || link_player_id()>1)return 0;
-        if(!(status&SIOM_SLAVE) && !(status&SIOM_ENABLE)) {
-            u16 peer=REG_SIOMULTI1;
-            /* Re-send the previous generation until the peer advances. This
-               also recovers a delayed serial IRQ during a VRAM DMA copy. */
-            int behind=have_last && (peer&0xe000)==0x8000 &&
-                ((peer>>10)&7)==((expected+7)&7);
+        u16 peer=(status&SIOM_SLAVE)?REG_SIOMULTI0:REG_SIOMULTI1;
+        int behind=have_last && (peer&0xe000)==0x8000 &&
+            ((peer>>10)&7)==((expected+7)&7);
+        if(status&SIOM_SLAVE) {
+            /* Either peer can miss a completion while copying VRAM. */
             REG_SIOMLT_SEND=behind?last_packet:pending_packet;
+        } else if(!(status&SIOM_ENABLE)) {
+            /* Alternate recovery and current packets: advertising the new
+               generation prevents both peers endlessly echoing the old one. */
+            REG_SIOMLT_SEND=behind && (++retry&1)?last_packet:pending_packet;
             REG_SIOCNT=SIO_MODE_MULTI|SIOM_115200|SIO_IRQ|SIOM_ENABLE;
         }
         /* Return to the UI after 100 ms; retain this exact pending input. */

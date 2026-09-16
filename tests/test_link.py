@@ -44,7 +44,7 @@ static _Atomic int connected=1,pending[2];
 static void (*handlers[2])(void);
 static pthread_mutex_t bus=PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t start;
-static unsigned ticks[2],transfers;
+static unsigned ticks[2],transfers,interrupts[2];
 _Atomic u16 *serial_status(int n) {
     atomic_fetch_or(&regs[n][0],(connected?8:0)|(n?20:0));
     if(!connected)atomic_fetch_and(&regs[n][0],(u16)~8);
@@ -57,11 +57,14 @@ u16 clock_tick(int n) {
     /* Artificial latency: not every poll completes a pending transfer. */
     if((regs[0][0]&128) && connected && (++transfers%5)==0) {
         u16 a=regs[0][2],b=regs[1][2];
+        if((transfers/5)%13==0)a^=0x2000; /* damaged packet header */
         for(int i=0;i<2;i++){regs[i][3]=a;regs[i][4]=b;pending[i]=1;}
         atomic_fetch_and(&regs[0][0],(u16)~128);
     }
     pthread_mutex_unlock(&bus);
-    if(regs[n][5] && atomic_exchange(&pending[n],0) && handlers[n])handlers[n]();
+    if(regs[n][5] && atomic_exchange(&pending[n],0) && handlers[n]) {
+        if(++interrupts[n]%7)handlers[n](); /* deliberately lose a completion */
+    }
     if((++ticks[n]&31)==0)sched_yield();
     return (u16)ticks[n];
 }
@@ -93,7 +96,7 @@ int main(void) {
     pthread_join(a,0);pthread_join(b,0);
     connected=0;u16 values[2];assert(!host_exchange(0,values));
     host_close();guest_close();
-    puts("PASS: two peers, delayed packets, sequence wrap, identical inputs/timing, disconnect");
+    puts("PASS: two peers, delayed/lost/corrupt packets, sequence wrap, identical inputs/timing, disconnect");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

@@ -561,6 +561,21 @@ int main(void) {
         player.boost=74*256;draw_match_hud();
         save_preview(mode?"fast-mode.ppm":"detailed-mode.ppm");
     }
+    draw_link_lobby(0,0,0);save_preview("link-lobby.ppm");
+    draw_link_lobby(1,1,1);save_preview("link-waiting.ppm");
+    {
+        is_hockey_match=1;active_pitch_mode=1;init_hockey_pitch_texture();
+        Vector3 camera={0,35*256,-100*256};
+        set_camera_lookat(camera,(Vector3){0,10*256,0},0);
+        draw_environment_background(14);
+        draw_stadium_crowd(camera,CAGE_WIDTH,CAGE_LENGTH);
+        draw_soccer_pitch(camera);
+        draw_stadium_curves(camera,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
+        draw_stadium_goal(STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,28);
+        draw_model_world(&puck_mesh,(Vector3){25*256,PUCK_HALF_HEIGHT,0},0,0,0,256,149,RENDER_FLAT);
+        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,RENDER_TEXTURED);
+        draw_match_hud();save_preview("hockey-updated.ppm");
+    }
     puts("PASS: stronger jumps, preserved landing attitude, gradual recovery, three animated garage effects, reduced ramp LOD work, four-wall climbing/jumps/descent, corner traversal, goal clearance, wall boost, gameplay LODs, frustum culling, 18 loadouts, complete rotations, fixed car pivots, diagonal thrust/exhaust, stadium camera sweep, mesh/UV validity, invalid mesh rejection");
 }
 '''

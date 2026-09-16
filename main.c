@@ -331,7 +331,7 @@ static int control_scheme = 0;     // 0 = Classic, 1 = Alternative
 static int screen_shake = 0;       // Screen shake duration counter
 static int show_boost_alert = 0;   // Frames to show "NO BOOST" warning
 static int cam_mode = 0;           // 0=Chase, 1=Front, 2=Ball-cam
-static int link_match,link_waiting,link_hockey;
+static int link_match,link_waiting,link_hockey,link_saved_opponent;
 static u16 link_buttons[2],link_previous[2];
 static int control_override;
 static u16 control_down,control_hits;
@@ -973,7 +973,7 @@ void reset_kickoff(void) {
     player.visual_pitch = 0;
     player.visual_roll = 0;
     player.flip_timer = player.boost_requested = 0;
-    camera_yaw = 0;  // Center camera behind player
+    camera_yaw = link_match && link_player_id()==1 ? 128 : 0;  // Local kickoff heading
 
     // Reset Opponent (Orange team) at north kickoff spot facing South (yaw = 128)
     opponent.pos.x = 0;
@@ -2080,20 +2080,21 @@ static void draw_achievements(int selection) {
     draw_centered_text_line("ARROWS:SELECT  B:BACK",143,130);
 }
 
-static void draw_menu_screen(GameState state, int selection) {
-    if (state == STATE_MENU_GARAGE) { draw_garage(); return; }
-    if (state == STATE_MENU_ACHIEVEMENTS) { draw_achievements(selection); return; }
-    if(state==STATE_MENU_LINK) {
+static void draw_link_lobby(int side,int hockey,int waiting) {
         clear_screen(144);
         draw_centered_text_line("2 PLAYER LINK",14,130);
-        draw_centered_text_line(link_player_id()?"PLAYER 2 - ORANGE":"PLAYER 1 - BLUE",38,131);
-        draw_centered_text_line(link_hockey?"HOCKEY":"SOCCER",66,130);
-        draw_centered_text_line(link_waiting?"CONNECT BOTH CONSOLES":"LINK READY",90,146);
+        draw_centered_text_line(side?"PLAYER 2 - ORANGE":"PLAYER 1 - BLUE",38,131);
+        draw_centered_text_line(hockey?"HOCKEY":"SOCCER",66,130);
+        draw_centered_text_line(waiting?"CONNECT BOTH CONSOLES":"LINK READY",90,146);
         draw_centered_text_line("HOST: LEFT/RIGHT MODE",112,130);
         draw_centered_text_line("HOST A: START  B:BACK",130,130);
         draw_centered_text_line("START+SELECT: EXIT MATCH",147,150);
-        return;
-    }
+}
+
+static void draw_menu_screen(GameState state, int selection) {
+    if (state == STATE_MENU_GARAGE) { draw_garage(); return; }
+    if (state == STATE_MENU_ACHIEVEMENTS) { draw_achievements(selection); return; }
+    if(state==STATE_MENU_LINK) {draw_link_lobby(link_player_id(),link_hockey,link_waiting);return;}
     /* Artwork backdrop for the remaining menus. */
     memcpy32(frame_buffer, coverart_data, 38400 / 4);
 
@@ -2347,7 +2348,8 @@ int main(void) {
         int network_step=1;
         if(link_match) {
             if(key_is_down(KEY_START) && key_is_down(KEY_SELECT)) {
-                link_close();link_match=link_waiting=0;game_state=STATE_MENU_PLAY;menu_selection=3;
+                link_close();link_match=link_waiting=0;enable_opponent=link_saved_opponent;
+                game_state=STATE_MENU_PLAY;menu_selection=3;
             } else {
                 network_step=link_step(link_local_buttons(),dt_time_frames,link_buttons,&dt_time_frames);
                 link_waiting=!network_step;
@@ -2429,6 +2431,7 @@ int main(void) {
                     link_hockey=values[0]&1;
                     if(values[0]&512) {
                         is_hockey_match=link_hockey;active_pitch_mode=link_hockey;
+                        link_saved_opponent=enable_opponent;
                         enable_opponent=1;link_match=1;
                         link_buttons[0]=link_buttons[1]=link_previous[0]=link_previous[1]=0;
                         srand(1);reset_match();
@@ -2527,7 +2530,7 @@ int main(void) {
                     if (enable_opponent) update_car_physics(&opponent, 0);
                 }
                 update_ball_physics();
-                capture_replay_frame();
+                if(!link_match)capture_replay_frame();
 
                 // Collision interactions
                 check_car_ball_collision(&player);
@@ -2914,9 +2917,9 @@ int main(void) {
             draw_stadium_floodlights();
 
             // Draw Shadows
-            draw_car_shadow(player.pos, player.yaw, garage_model[0]);
+            draw_car_shadow(player.pos, player.yaw, garage_model[player.team==6]);
             if (enable_opponent && game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
-                draw_car_shadow(opponent.pos, opponent.yaw, garage_model[1]);
+                draw_car_shadow(opponent.pos, opponent.yaw, garage_model[opponent.team==6]);
             }
             draw_ball_ground_shadow(ball.pos);
 
