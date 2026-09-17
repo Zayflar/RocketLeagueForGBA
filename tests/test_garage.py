@@ -56,7 +56,8 @@ static inline void memset32(void *p,u32 v,int n) { u32 *q=p; while(n--) *q++=v; 
     particle_code=main[main.index('typedef struct {',main.index('/* --- Particles --- */')):main.index('enum {',main.index('/* --- Particles --- */'))]
     particle_spawn=main[main.index('void spawn_boost_particle'):main.index('void spawn_skid_particle')]
     constants='\n'.join(line for line in main.splitlines() if line.startswith(('#define FLIP_', '#define BOOST_ACCEL', '#define MAX_DRIVE_SPEED', '#define ACCEL_RATE', '#define GRAVITY', '#define DRAG_COEFF', '#define CAR_RADIUS', '#define BALL_RADIUS', '#define PUCK_', '#define JUMP_FORCE')))
-    harness='''#include "achievements.c"
+    harness='''static void audio_impact(int strength){(void)strength;}
+#include "achievements.c"
 #include "models.h"
 #include "stadium.h"
 #include <stdlib.h>
@@ -93,6 +94,13 @@ static struct {int boosted,goal_scored;} tutorial_progress;
 '''+pitch_constants+'\n'+pitch+radar+boost_code+physics+ball_physics+collisions+hud_text+match_hud+'''
 int main(void) {
     init_3d_engine(); init_dynamic_models(); init_mesh_normals();
+    /* Mixed grass/ramp footprint keeps each surface's own shadow tint. */
+    for(int i=0;i<12;i++)frame_buffer[i]=i<4?135:i<8?154:SHADOW_RAMP_START+3;
+    fast_span_fill(frame_buffer,SHADOW_GRASS_EDGE*0x01010101u,12);
+    for(int i=0;i<4;i++)assert(frame_buffer[i]==SHADOW_GRASS_EDGE);
+    for(int i=4;i<12;i++)assert(frame_buffer[i]==SHADOW_RAMP_START+3);
+    fast_span_fill(frame_buffer,SHADOW_GRASS_CORE*0x01010101u,12);
+    for(int i=4;i<12;i++)assert(frame_buffer[i]==SHADOW_RAMP_START+2);
     performance_mode=0;
     {
         Car c={0};apply_air_rotation(&c,1,-1);

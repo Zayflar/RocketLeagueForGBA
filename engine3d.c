@@ -254,6 +254,8 @@ void init_3d_engine(void) {
             26 + (4 * i + 7) / 15);
     }
 
+    for(int i=0;i<8;i++)pal_bg_mem[SHADOW_RAMP_START+i]=RGB5(12+i*2,12+i*2,12+i*2);
+
     /* Dedicated smooth white/cool-gray ramp for the spherical ball sprite. */
     for (int i=0;i<32;i++) {
         int shade=7+(24*i)/31;

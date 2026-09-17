@@ -135,7 +135,7 @@ int world_target_indicator(Vector3 pos, int *sx, int *sy);
  */
 /* Dedicated environment colors, separate from UI and black tyre materials. */
 enum {
-    SHADOW_GRASS_EDGE = 158, SHADOW_GRASS_CORE,
+    SHADOW_RAMP_START = 224, SHADOW_GRASS_EDGE = 158, SHADOW_GRASS_CORE,
     SHADOW_ICE_EDGE, SHADOW_ICE_CORE,
     SKY_GRADIENT_START, SKY_GRADIENT_COUNT = 16,
     ICE_SURFACE_STRIPE = SKY_GRADIENT_START + SKY_GRADIENT_COUNT,

@@ -1,0 +1,65 @@
+[
+  {
+    "id": "HIT",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/ball_hit_01.wav",
+    "samples": 9830,
+    "frames": 72,
+    "gain": 0.65
+  },
+  {
+    "id": "HIT2",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/ball_hit_02.wav",
+    "samples": 9830,
+    "frames": 72,
+    "gain": 0.65
+  },
+  {
+    "id": "HIT3",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/ball_hit_03.wav",
+    "samples": 9830,
+    "frames": 72,
+    "gain": 0.65
+  },
+  {
+    "id": "GOAL",
+    "source": "/home/hector/RocketLeagueForGBA/assets/audio/source/goal_explosion.wav",
+    "samples": 48836,
+    "frames": 357,
+    "gain": 0.8
+  },
+  {
+    "id": "JUMP",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/car_move_01.wav",
+    "samples": 8192,
+    "frames": 60,
+    "gain": 0.45
+  },
+  {
+    "id": "MOVE",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/ui_01.wav",
+    "samples": 818,
+    "frames": 6,
+    "gain": 0.12
+  },
+  {
+    "id": "SELECT",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/ui_02.wav",
+    "samples": 1638,
+    "frames": 12,
+    "gain": 0.18
+  },
+  {
+    "id": "BOOST",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/boost_loop.wav",
+    "samples": 11946,
+    "frames": 88,
+    "gain": 0.36
+  },
+  {
+    "id": "MUSIC",
+    "source": "/home/hector/RocketLeague-Audio/gba_audio/pcm/music_map_09.wav",
+    "samples": 263827,
+    "frames": 1924,
+    "gain": 0.25
+  }
+]

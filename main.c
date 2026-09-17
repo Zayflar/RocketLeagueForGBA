@@ -12,6 +12,7 @@
 #include "stadium.h"
 #include "link.h"
 #include "achievements.h"
+#include "audio.h"
 #include "coverart.h"
 
 /* --- Game State Definitions --- */
@@ -1365,6 +1366,7 @@ void update_ball_physics(void) {
 
     // 1. Floor collision
     if (ball.pos.y <= half_height) {
+        if(ball.vel.y < -FP_SCALE)audio_impact(-ball.vel.y);
         ball.pos.y = half_height;
         ball.vel.y = ball.vel.y<0 ? -ball.vel.y*(is_hockey_match?18:65)/100 : ball.vel.y;
         if(ball.vel.y < (is_hockey_match?FP_SCALE:FP_SCALE/2)) ball.vel.y=0;
@@ -1389,6 +1391,7 @@ void update_ball_physics(void) {
     if(touched && angle) {
         fixed impact=FP_MUL(ball.vel.x,normal.x)+FP_MUL(ball.vel.y,normal.y)+FP_MUL(ball.vel.z,normal.z);
         if(impact<0) {
+            if(impact < -FP_SCALE)audio_impact(-impact);
             impact=impact*170/100;
             ball.vel.x-=FP_MUL(normal.x,impact);
             ball.vel.y-=FP_MUL(normal.y,impact);
@@ -1506,6 +1509,7 @@ int check_car_ball_collision(Car *car) {
         fixed vel_along_norm = (rvx * nx + rvy * ny + rvz * nz) >> 8;
 
         if (vel_along_norm < 0) {
+            audio_impact(-vel_along_norm);
             /* One impulse, with car:ball mass ratio 8:1 and restitution
                0.35. Tangential velocity is untouched, so grazing contacts
                redirect the ball without inventing extra forward energy. */
@@ -2078,23 +2082,32 @@ static void draw_achievements(int selection) {
     };
     static const unsigned char family[ACH_COUNT]={0,0,1,2,3,4,0,0,0,1,1,1,2,2,3,3,3,5,5,5,0,2,1,1};
     static const unsigned char rank[ACH_COUNT]={1,2,1,1,1,1,3,4,5,2,3,4,2,3,2,3,4,1,2,3,6,6,5,6};
+    /* Display order only: saved achievement IDs remain stable. */
+    static const unsigned char order[ACH_COUNT]={
+        ACH_GOAL,ACH_TEN_GOALS,ACH_GOALS_25,ACH_GOALS_50,ACH_GOALS_100,ACH_SOCCER_WIN,
+        ACH_WIN,ACH_WINS_5,ACH_WINS_10,ACH_WINS_25,ACH_LINK_WIN,ACH_SHUTOUT,
+        ACH_HOCKEY,ACH_HOCKEY_10,ACH_HOCKEY_25,ACH_MATCH,ACH_MATCHES_10,ACH_MATCHES_50,
+        ACH_HOCKEY_WIN,ACH_WALL,ACH_WALL_15,ACH_WALL_30,ACH_WALL_60,ACH_TUTORIAL
+    };
     clear_screen(144);
     draw_centered_text_line("ACHIEVEMENTS",3,130);
     int unlocked=0;
     for(int i=0;i<ACH_COUNT;i++)unlocked+=achievement_progress[i]>=achievement_targets[i];
     char summary[24];snprintf(summary,sizeof(summary),"%d / 24 UNLOCKED",unlocked);
     draw_centered_text_line(summary,15,146);
-    for(int i=0;i<ACH_COUNT;i++) {
-        int x=7+(i%6)*38,y=27+(i/6)*20;
+    for(int cell=0;cell<ACH_COUNT;cell++) {
+        int i=order[cell];
+        int x=7+(cell%6)*38,y=27+(cell/6)*20;
         int done=achievement_progress[i]>=achievement_targets[i];
-        draw_hud_box(x,y,35,19,i==selection?145:5,i==selection?131:done?146:150);
-        u8 color=done?131:i==selection?130:153;
+        draw_hud_box(x,y,35,19,cell==selection?145:5,cell==selection?131:done?146:150);
+        u8 color=done?131:cell==selection?130:153;
         for(int row=0;row<12;row++)for(int col=0;col<12;col++)
             if(icons[family[i]][row]&(1u<<(11-col)))
                 frame_buffer[(y+2+row)*SCREEN_WIDTH+x+11+col]=color;
         for(int r=0;r<rank[i];r++)draw_line(x+3+r*5,y+16,x+4+r*5,y+16,color);
         if(done) {draw_line(x+28,y+4,x+30,y+6,146);draw_line(x+30,y+6,x+33,y+2,146);}
     }
+    selection=order[selection];
     draw_centered_text_line(achievement_names[selection],109,131);
     draw_centered_text_line(achievement_descriptions[selection],122,130);
     char progress[28];
@@ -2146,16 +2159,18 @@ static void draw_menu_screen(GameState state, int selection) {
         draw_centered_menu_text("LEFT RIGHT:LEVEL", 108, 130);
     } else if (state == STATE_MENU_SETTINGS) {
         char value[24];
-        draw_centered_menu_text("SETTINGS", 38, 131);
+        draw_centered_menu_text("SETTINGS", 28, 131);
         snprintf(value, sizeof(value), "AI LEVEL: %d", ai_difficulty);
-        draw_centered_menu_item(value, 68, selection == 0);
+        draw_centered_menu_item(value, 52, selection == 0);
         snprintf(value, sizeof(value), "OPPONENT: %s", enable_opponent ? "ON" : "OFF");
-        draw_centered_menu_item(value, 84, selection == 1);
+        draw_centered_menu_item(value, 68, selection == 1);
         snprintf(value, sizeof(value), "CTRL: %s", control_scheme ? "ALT" : "CLASSIC");
-        draw_centered_menu_item(value, 100, selection == 2);
+        draw_centered_menu_item(value, 84, selection == 2);
         snprintf(value,sizeof(value),"GRAPHICS: %s",performance_mode?"FAST":"DETAILED");
-        draw_centered_menu_item(value,116,selection==3);
-        draw_centered_menu_item("BACK",132,selection==4);
+        draw_centered_menu_item(value,100,selection==3);
+        snprintf(value,sizeof(value),"SOUND: %s",audio_enabled()?"ON":"OFF");
+        draw_centered_menu_item(value,116,selection==4);
+        draw_centered_menu_item("BACK",132,selection==5);
         draw_centered_menu_text("LEFT RIGHT:CHANGE", 150, 129);
 
     }
@@ -2270,8 +2285,10 @@ static void handle_player_input(void) {
     if (btn_jump) {
         if (player.is_on_ground) {
             if (game_state == STATE_TUTORIAL) tutorial_progress.jumped = 1;
+            audio_play(AUDIO_JUMP);
             jump_from_surface(&player,(JUMP_FORCE*3)/5);
         } else if (player.can_double_jump) {
+            audio_play(AUDIO_JUMP);
             if (game_state == STATE_TUTORIAL) tutorial_progress.double_jumped = 1;
             player.can_double_jump = 0;
             player.jump_hold=0;
@@ -2329,6 +2346,8 @@ static u16 link_local_buttons(void) {
     return keys;
 }
 
+static void game_vblank(void) { video_vblank(); audio_vblank(); }
+
 int main(void) {
     // Setup hardware Mode 4 and custom palettes
     achievements_init((volatile unsigned char *)0x0e000000);
@@ -2337,7 +2356,8 @@ int main(void) {
     init_mesh_normals();       // Precalculate face normals in model space
 
     irq_init(NULL);
-    irq_set(II_VBLANK, video_vblank, ISR_DEF);
+    audio_init();
+    irq_set(II_VBLANK, game_vblank, ISR_DEF);
     irq_enable(II_VBLANK);
     REG_DISPSTAT |= DSTAT_VBL_IRQ;
 
@@ -2384,6 +2404,10 @@ int main(void) {
             }
         }
         // 1. STATE MACHINE UPDATES
+        if(game_state<=STATE_MENU_LINK) {
+            if(key_hit(KEY_A|KEY_START|KEY_B))audio_play(AUDIO_SELECT);
+            else if(key_hit(KEY_UP|KEY_DOWN|KEY_LEFT|KEY_RIGHT))audio_play(AUDIO_MOVE);
+        }
         int achievement_previous_state=game_state;
         if(network_step) switch (game_state) {
             case STATE_START_SCREEN:
@@ -2487,8 +2511,8 @@ int main(void) {
                 break;
 
             case STATE_MENU_SETTINGS:
-                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 4) % 5;
-                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 5;
+                if (key_hit(KEY_UP)) menu_selection = (menu_selection + 5) % 6;
+                if (key_hit(KEY_DOWN)) menu_selection = (menu_selection + 1) % 6;
                 
                 if (key_hit(KEY_B)) {
                     game_state = STATE_TITLE; menu_selection = 1;
@@ -2508,6 +2532,8 @@ int main(void) {
                 } else if (menu_selection == 3) {
                     if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A)) performance_mode^=1;
                 } else if (menu_selection == 4) {
+                    if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A))audio_set_enabled(!audio_enabled());
+                } else if (menu_selection == 5) {
                     if (key_hit(KEY_A) || key_hit(KEY_START)) {
                         game_state = STATE_TITLE; menu_selection = 1;
                     }
@@ -2844,6 +2870,15 @@ int main(void) {
             if(achievement_previous_state==STATE_PLAY && local->is_on_ground && local->surface_wall &&
                local->surface_angle>=48 && abs(local->speed)>FP_SCALE)achievement_add(ACH_WALL,dt_time_frames);
         }
+        if(game_state!=achievement_previous_state) {
+            if(game_state==STATE_GOAL || game_state==STATE_TRAINING_GOAL)audio_play(AUDIO_GOAL);
+        }
+        const Car *audio_car=link_match && link_player_id()==1?&opponent:&player;
+        if(game_state==STATE_TITLE)audio_loop(AUDIO_MUSIC);
+        else if(network_step && (game_state==STATE_PLAY || game_state==STATE_TRAINING || game_state==STATE_TUTORIAL))
+            audio_loop(key_is_down(KEY_B) && audio_car->boost>0?AUDIO_BOOST:
+                -1);
+        else audio_loop(-1);
         if(achievement_toast_timer>0)achievement_toast_timer-=dt_time_frames;
         if(achievement_toast_timer<=0) {
             achievement_toast=achievement_next_unlock();

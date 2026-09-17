@@ -147,3 +147,25 @@ frames at normal camera distances. The precomputed 64×64 frames stay in ROM,
 with no added mesh faces or persistent RAM buffer. Extreme close-ups retain the
 near-plane-clipped mesh; physics and hockey rendering are unchanged. Regenerate
 the sprite data with `python3 tools/gen_ball_sprite.py`.
+
+## Sound
+
+Quiet navigation and confirmation sounds play in menus. Engine and idle sounds
+are removed, including their roughly once-per-second restart. During gameplay,
+boost audio plays only while boosting; jumps, impacts, and goals remain event-based.
+Menu clicks last 0.1 seconds, confirmation cues 0.2 seconds, both at reduced volume.
+Music, pickups, and achievement notifications remain silent. Settings → Sound mutes
+all audio. The eight clips occupy about 103 KiB of ROM with no sample RAM buffer.
+Impacts retain up to 1.2 seconds and goals their full nearly-six-second tail.
+Build and automated checks pass; emulator/hardware listening remains unverified.
+
+Achievement icons are grouped by scoring, wins, hockey, matches played, and wall
+progression, with increasing milestones next to each other. Display reordering
+preserves existing saved unlocks and progress.
+
+Main-menu music now loops the supplied `music_map_09` clip (about 32 seconds),
+at a subdued volume. The archive has no song-title metadata. Music stops when
+leaving the main menu, and the Sound setting controls it alongside effects.
+Engine/idle sounds remain disabled. Shadows now use neutral grey shades over
+wall ramps, including shadows straddling grass and ramp surfaces. The renderer
+shares its span-fill routine to preserve fast-memory stack headroom.

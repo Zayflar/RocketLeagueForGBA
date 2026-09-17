@@ -4,7 +4,7 @@ import subprocess,tempfile,os
 root=Path(__file__).resolve().parents[1]
 main=(root/'main.c').read_text()
 a=main.index('        if(network_step) {\n            int local_team=')
-b=main.index('        if(achievement_toast_timer>0)',a)
+b=main.index('        if(game_state!=achievement_previous_state)',a)
 events=main[a:b]
 source='''#include "achievements.h"
 #include <assert.h>

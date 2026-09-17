@@ -27,8 +27,8 @@ GBAFIX  := $(DEVKITPRO)/tools/bin/gbafix
 TARGET  := gba_3d
 
 # Sources and Objects
-SOURCES := main.c engine3d.c render.c models.c stadium.c link.c achievements.c
-OBJS    := $(SOURCES:.c=.o)
+SOURCES := main.c engine3d.c render.c models.c stadium.c link.c achievements.c audio.c
+OBJS    := $(SOURCES:.c=.o) audio_bank.o
 
 # GBA ARM7TDMI Architecture compiler flags
 # -mthumb            : Use space-efficient 16-bit Thumb instruction set
@@ -65,6 +65,10 @@ $(TARGET).elf: $(OBJS)
 main.o stadium.o: stadium.h
 main.o link.o: link.h
 main.o achievements.o: achievements.h
+main.o audio.o: audio.h assets/audio/sounds.h
+audio.o: assets/audio/sounds.inc
+audio_bank.o: audio_bank.S assets/audio/sounds.bin
+	$(CC) $(ARCH) -c $< -o $@
 engine3d.o: ball_sprite.inc
 models.o: car_models.inc models.h engine3d.h
 main.o engine3d.o render.o stadium.o: engine3d.h render.h models.h

@@ -110,9 +110,26 @@ void swap_buffers(void) {
 }
 
 /* --- Fast 32-bit Word Span Filler --- */
-static inline void inline_span_fill(u8 *dst, u32 color4, int count) {
+/* Keep the small surface-aware path in ROM, preserving the IWRAM stack. */
+static __attribute__((noinline,long_call)) void shadow_span_fill(u8 *dst,u8 shade,int count) {
+    int core=shade==SHADOW_GRASS_CORE || shade==SHADOW_ICE_CORE;
+    while(count--) {
+        int base=*dst,level;
+        if(base>=150 && base<=157)level=base-150-1-core;
+        else if(base>=SHADOW_RAMP_START && base<SHADOW_RAMP_START+8)
+            level=base-SHADOW_RAMP_START-core;
+        else {*dst++=shade;continue;}
+        *dst++=SHADOW_RAMP_START+(level<0?0:level);
+    }
+}
+
+static IWRAM_CODE __attribute__((noinline)) void inline_span_fill(u8 *dst, u32 color4, int count) {
     if (count <= 0) return;
-    
+    u8 shade=(u8)color4;
+    if(shade>=SHADOW_GRASS_EDGE && shade<=SHADOW_ICE_CORE) {
+        shadow_span_fill(dst,shade,count);
+        return;
+    }
     if (count < 8) {
         while (count > 0) {
             *dst++ = (u8)color4;
