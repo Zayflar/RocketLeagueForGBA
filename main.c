@@ -256,16 +256,16 @@ static int settle_angle(int angle, int *velocity) {
 
 static int smooth_camera_heading(int current,int target) {
     int delta=(target-current)&255;if(delta>128)delta-=256;
-    int step=delta/4;
+    int step=delta/8;
     if(!step && delta)step=delta>0?1:-1;
-    if(step>10)step=10;
-    if(step<-10)step=-10;
+    if(step>4)step=4;
+    if(step<-4)step=-4;
     return (current+step)&255;
 }
 
 static void apply_air_rotation(Car *car,int pitch,int roll) {
-    car->visual_pitch=(car->visual_pitch+pitch*6)&255;
-    car->visual_roll=(car->visual_roll+roll*12)&255;
+    car->visual_pitch=(car->visual_pitch+pitch*9)&255;
+    car->visual_roll=(car->visual_roll+roll*18)&255;
 }
 
 /* Rotate the standing pivot offset as well as the body. Wheel contact stays
@@ -506,16 +506,16 @@ void draw_soccer_pitch(Vector3 cam_pos) {
         draw_world_line((Vector3){-STADIUM_WIDTH,0,0},(Vector3){STADIUM_WIDTH,0,0},line_color);
         /* Shared projections keep the circle cheap; crossing segments use near clipping. */
         int x[16],y[16],visible[16];
-        for(int i=0;i<16;i++) visible[i]=project_vertex_world(center_circle_pts[i],&x[i],&y[i]);
-        for(int i=0;i<16;i++) {
-            int next=(i+1)&15;
+        for(int i=0;i<16;i+=performance_mode==2?2:1) visible[i]=project_vertex_world(center_circle_pts[i],&x[i],&y[i]);
+        for(int i=0;i<16;i+=performance_mode==2?2:1) {
+            int next=(i+(performance_mode==2?2:1))&15;
             if(visible[i] && visible[next]) draw_line(x[i],y[i],x[next],y[next],line_color);
             else if(visible[i] || visible[next]) draw_world_line(center_circle_pts[i],center_circle_pts[next],line_color);
         }
         draw_world_line((Vector3){-2*FP_SCALE,0,0},(Vector3){2*FP_SCALE,0,0},line_color);
         for(int side=-1;side<=1;side+=2) {
             fixed end=side*STADIUM_LENGTH;
-            for(int area=0;area<2;area++) {
+            for(int area=0;area<(performance_mode==2?1:2);area++) {
                 fixed width=(area?110:150)*FP_SCALE;
                 fixed front=end-side*(area?24:50)*FP_SCALE;
                 Vector3 left={-width,0,end},left_front={-width,0,front};
@@ -533,6 +533,7 @@ void draw_soccer_pitch(Vector3 cam_pos) {
     if(is_hockey_match)draw_hockey_markings(STADIUM_WIDTH,STADIUM_LENGTH);
     int cam_x = cam_pos.x;
     int cam_z = cam_pos.z;
+    if(performance_mode==2)return;
     draw_stadium_hex_walls(cam_pos, STADIUM_WIDTH, STADIUM_LENGTH, STADIUM_HEIGHT);
 
     // Vertical Pillars at corners
@@ -609,6 +610,27 @@ static void draw_car_shadow(Vector3 pos, int yaw, int model) {
     pos.x -= height * 96;
     pos.z += height * 51;
     pos.y = FP_SCALE;
+    if(!world_sphere_visible(pos,40*FP_SCALE))return;
+    if(performance_mode) {
+        int sx,sy,ex,ey;
+        Vector3 edge=pos;edge.x+=15*FP_SCALE;
+        if(!project_vertex_world(pos,&sx,&sy) || !project_vertex_world(edge,&ex,&ey))return;
+        int radius=abs(ex-sx)+abs(ey-sy);
+        if(radius<2)radius=2;
+        if(radius>24)radius=24;
+        int ry=radius/3+1;
+        for(int y=-ry;y<=ry;y++) {
+            int py=sy+y;
+            if(py<0 || py>=RENDER_HEIGHT)continue;
+            int span=radius-abs(y)*radius/(ry+1);
+            int left=sx-span,right=sx+span;
+            if(left<0)left=0;
+            if(right>=RENDER_WIDTH)right=RENDER_WIDTH-1;
+            if(right>=left)fast_span_fill(frame_buffer+py*SCREEN_WIDTH+left,
+                (is_hockey_match?SHADOW_ICE_EDGE:SHADOW_GRASS_EDGE)*0x01010101u,right-left+1);
+        }
+        return;
+    }
     for (int layer = 0; layer < 2; ++layer) {
         /* The dense contact core gradually shrinks as the car lifts off. */
         int width = layer ? 11 - height / 16 : 15 + height / 24;
@@ -1732,7 +1754,7 @@ void update_ai_behavior(void) {
 }
 
 static void draw_hud_text(const char *text, int x, int y, u8 color) {
-    draw_string(text,x+1,y+1,132);
+    if(performance_mode!=2)draw_string(text,x+1,y+1,132);
     draw_string(text,x,y,color);
 }
 
@@ -2166,7 +2188,7 @@ static void draw_menu_screen(GameState state, int selection) {
         draw_centered_menu_item(value, 68, selection == 1);
         snprintf(value, sizeof(value), "CTRL: %s", control_scheme ? "ALT" : "CLASSIC");
         draw_centered_menu_item(value, 84, selection == 2);
-        snprintf(value,sizeof(value),"GRAPHICS: %s",performance_mode?"FAST":"DETAILED");
+        snprintf(value,sizeof(value),"GRAPHICS: %s",performance_mode==2?"SPEED":performance_mode?"FAST":"DETAILED");
         draw_centered_menu_item(value,100,selection==3);
         snprintf(value,sizeof(value),"SOUND: %s",audio_enabled()?"ON":"OFF");
         draw_centered_menu_item(value,116,selection==4);
@@ -2256,24 +2278,12 @@ static void handle_player_input(void) {
         }
     }
 
-    // Camera Yaw Logic
-    int diff = (player.yaw - camera_yaw) & 255;
-    if (diff != 0) {
-        if (diff < 128) {
-            int step = (diff / 4) + 1;
-            if (step >= diff) step = diff;
-            camera_yaw = (camera_yaw + step) & 255;
-        } else {
-            int diff2 = 256 - diff;
-            int step = (diff2 / 4) + 1;
-            if (step >= diff2) step = diff2;
-            camera_yaw = (camera_yaw - step) & 255;
-        }
-    }
+    /* Chase and ball cameras share a bounded shortest-path turn. */
+    camera_yaw=smooth_camera_heading(camera_yaw,player.yaw);
 
     /* Camera cycle is handled globally in the game loop via KEY_L hit */
 
-    // Aerial Pitch/Roll: 50% faster while the aerial modifier is held.
+    // Faster arrow-controlled pitch/roll while the aerial modifier is held.
     if (btn_aerial_mod && !player.is_on_ground && player.flip_timer == 0 && !btn_jump) {
         int pitch=(drive_down(KEY_UP)?1:0)-(drive_down(KEY_DOWN)?1:0);
         int roll=(drive_down(KEY_LEFT)?1:0)-(drive_down(KEY_RIGHT)?1:0);
@@ -2349,6 +2359,8 @@ static u16 link_local_buttons(void) {
 static void game_vblank(void) { video_vblank(); audio_vblank(); }
 
 int main(void) {
+    /* Standard cartridge timing plus instruction prefetch for ROM helpers. */
+    REG_WAITCNT=(REG_WAITCNT & ~0x1c) | WS_ROM0_N3 | WS_ROM0_S1 | WS_PREFETCH;
     // Setup hardware Mode 4 and custom palettes
     achievements_init((volatile unsigned char *)0x0e000000);
     init_3d_engine();          // Also calls init_pitch_texture() for soccer
@@ -2530,7 +2542,7 @@ int main(void) {
                         control_scheme = !control_scheme;
                     }
                 } else if (menu_selection == 3) {
-                    if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A)) performance_mode^=1;
+                    if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A)) performance_mode=(performance_mode+1)%3;
                 } else if (menu_selection == 4) {
                     if(key_hit(KEY_LEFT)||key_hit(KEY_RIGHT)||key_hit(KEY_A))audio_set_enabled(!audio_enabled());
                 } else if (menu_selection == 5) {
@@ -2958,7 +2970,7 @@ int main(void) {
                 /* Keep enough distance to frame the whole car, even when the
                    ball is directly in front of its bumper. */
                 fixed horiz_sq = (dx_b >> 8) * (dx_b >> 8) + (dz_b >> 8) * (dz_b >> 8);
-                int horiz_dist = (int)fast_sqrt(horiz_sq);   /* in FP>>8 units */
+                int horiz_dist = collision_sqrt(horiz_sq);   /* in FP>>8 units */
                 int cam_dist = 70 + (horiz_dist >> 3);
                 if (cam_dist > 120) cam_dist = 120;
 
@@ -2999,16 +3011,16 @@ int main(void) {
             u8 sky_col = is_hockey_match ? 14 : 128; /* bright white/light for hockey arena */
             draw_environment_background(sky_col);
 
-            draw_stadium_crowd(cam_pos, CAGE_WIDTH, CAGE_LENGTH);
+            if(performance_mode!=2)draw_stadium_crowd(cam_pos, CAGE_WIDTH, CAGE_LENGTH);
 
             // Draw 3D Soccer Pitch Lines
             draw_soccer_pitch(cam_pos);
             draw_stadium_curves(cam_pos,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
-            draw_stadium_floodlights();
+            if(performance_mode!=2)draw_stadium_floodlights();
 
             // Draw Shadows
             draw_car_shadow(player.pos, player.yaw, garage_model[player.team==6]);
-            if (enable_opponent && game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
+            if (performance_mode!=2 && enable_opponent && game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
                 draw_car_shadow(opponent.pos, opponent.yaw, garage_model[opponent.team==6]);
             }
             draw_ball_ground_shadow(ball.pos);
@@ -3212,12 +3224,12 @@ int main(void) {
                 if (items[i].id == 0) {
                     int32_t mod_m[9];
                     build_car_rotation(&player, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[player.team==6], items[i].dist), surface_car_position(garage_model[player.team==6], &player, mod_m), mod_m, FP_ONE, team_paints[player.team==6][garage_paint[player.team==6]], RENDER_TEXTURED);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[player.team==6], items[i].dist), surface_car_position(garage_model[player.team==6], &player, mod_m), mod_m, FP_ONE, team_paints[player.team==6][garage_paint[player.team==6]], performance_mode?RENDER_FLAT:RENDER_TEXTURED);
                 } else if (items[i].id == 1 && enable_opponent &&
                            game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
                     int32_t mod_m[9];
                     build_car_rotation(&opponent, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[opponent.team==6], items[i].dist), surface_car_position(garage_model[opponent.team==6], &opponent, mod_m), mod_m, FP_ONE, team_paints[opponent.team==6][garage_paint[opponent.team==6]], RENDER_TEXTURED);
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[opponent.team==6], items[i].dist), surface_car_position(garage_model[opponent.team==6], &opponent, mod_m), mod_m, FP_ONE, team_paints[opponent.team==6][garage_paint[opponent.team==6]], performance_mode?RENDER_FLAT:RENDER_TEXTURED);
                 } else if (items[i].id == 2) {
                     if (is_hockey_match) {
                         /* Dark rubber puck contrasts with the ice. */
@@ -3237,7 +3249,7 @@ int main(void) {
             if (key_is_down(KEY_SELECT) && game_state != STATE_PAUSED && game_state != STATE_TUTORIAL) {
                 draw_big_radar();
             } else if (game_state!=STATE_TUTORIAL && game_state!=STATE_TUTORIAL_BRIEFING && game_state!=STATE_TUTORIAL_COMPLETE) {
-                draw_radar();
+                if(performance_mode!=2)draw_radar();
             }
 
             // ==== HUD LAYOUT =================================================

@@ -6,7 +6,7 @@
 #include "engine3d.h"
 #include <string.h>
 
-int performance_mode=1;
+int performance_mode=2;
 
 /* --- Shared EWRAM Frame Buffer --- */
 u8 frame_buffer[240 * 160] __attribute__((section(".ewram"), aligned(4)));
@@ -336,6 +336,12 @@ static inline int project_quotient(int numerator, int depth, int reciprocal) {
     return value;
 }
 static IWRAM_CODE __attribute__((noinline)) void project_camera_point(fixed x, fixed y, fixed z, int *sx, int *sy) {
+    if(performance_mode==2 && z>=8*FP_SCALE && z<2048*FP_SCALE) {
+        int reciprocal=custom_div_lut[z>>8];
+        *sx=(int)(((int64_t)x*120*reciprocal)>>24)+120;
+        *sy=(int)(((int64_t)-y*120*reciprocal)>>24)+80;
+        return;
+    }
     int reciprocal=1073741824/z;
     *sx=project_quotient(x*120,z,reciprocal)+120/RENDER_SCALE;
     *sy=project_quotient(-y*120,z,reciprocal)+80/RENDER_SCALE;
@@ -356,6 +362,13 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
     int start_y = horizon_y;
     if (start_y < 0) start_y = 0;
     if (start_y > 160) start_y = 160;
+
+    if(performance_mode==2) {
+        /* Flat field and horizon bands leave cycles for 60 Hz car motion. */
+        memset32(frame_buffer,(sky_color==14?14u:169u)*0x01010101u,start_y*60);
+        memset32(frame_buffer+start_y*240,(sky_color==14?14u:135u)*0x01010101u,(160-start_y)*60);
+        return;
+    }
 
     int aligned_start_y = (start_y + 1) & ~1;
     if (aligned_start_y > 160) aligned_start_y = 160;
@@ -571,7 +584,15 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
 
 /* --- Math Utils --- */
 int32_t int_sqrt(int32_t val) {
-    return fast_sqrt(val);
+    if(val<=0)return 0;
+    unsigned value=(unsigned)val,root=0,bit=1u<<30;
+    while(bit>value)bit>>=2;
+    while(bit) {
+        if(value>=root+bit){value-=root+bit;root=(root>>1)+bit;}
+        else root>>=1;
+        bit>>=2;
+    }
+    return (int32_t)root;
 }
 
 /* Mesh materials use palette groups 0..7.  Values above that are literal
@@ -702,7 +723,7 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
             fixed nz = (e1_x * e2_y - e1_y * e2_x) >> FP_SHIFT;
 
             int32_t len_sq = nx*nx + ny*ny + nz*nz;
-            int32_t len = fast_sqrt(len_sq);
+            int32_t len = int_sqrt(len_sq);
             
             int32_t norm_z = 0;
             if (len > 0) {
@@ -786,7 +807,7 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch) {
     fixed dx_s = dx >> 4;
     fixed dz_s = dz >> 4;
     int32_t len_sq = dx_s*dx_s + dz_s*dz_s;
-    int32_t len = fast_sqrt(len_sq);
+    int32_t len = int_sqrt(len_sq);
     
     if (len > 0) {
         fixed dir_x = (dx_s * 256) / len;
@@ -871,7 +892,7 @@ int world_bounds_visible(Vector3 lo, Vector3 hi) {
 }
 
 /* Clip world-space wirework at the near plane before the 2D viewport clip. */
-void draw_world_line(Vector3 a, Vector3 b, u8 color) {
+IWRAM_CODE void draw_world_line(Vector3 a, Vector3 b, u8 color) {
     Vector3 points[2]={a,b};
     for(int i=0;i<2;i++) {
         fixed x=points[i].x-camera_pos.x, y=points[i].y-camera_pos.y, z=points[i].z-camera_pos.z;
@@ -912,7 +933,7 @@ IWRAM_CODE int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {
 /* Camera-facing sphere impostor, drawn in the same painter order as cars.
  * Return 0 only for extreme close-ups, where the clipped mesh is safer.
  * UV steps use integer additions; lighting and panel animation live in ROM. */
-int draw_soccer_ball(Vector3 pos, int yaw, int pitch) {
+IWRAM_CODE int draw_soccer_ball(Vector3 pos, int yaw, int pitch) {
     fixed rx=pos.x-camera_pos.x, ry=pos.y-camera_pos.y, rz=pos.z-camera_pos.z;
     fixed x=(rx*cam_m00+rz*cam_m02)>>12;
     fixed y=(rx*cam_m10+ry*cam_m11+rz*cam_m12)>>12;

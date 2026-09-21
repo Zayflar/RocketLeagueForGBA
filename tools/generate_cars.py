@@ -31,6 +31,12 @@ def build(kind, detail=0):
     segments = (8, 6, 4)[detail]
     for side in (-1,1):
         for z in (-11,11):
+            if detail==2:
+                off=len(vertices);x=side*15
+                vertices.extend([(x,0,z-5),(x,10,z-5),(x,10,z+5),(x,0,z+5)])
+                for ids in ((0,1,2),(0,2,3),(2,1,0),(3,2,0)):
+                    tri(tuple(off+i for i in ids),5,material=132)
+                continue
             off=len(vertices)
             for x in (side*10,side*15):
                 for i in range(segments):

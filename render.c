@@ -57,6 +57,8 @@ static const u8 font_8x8[42][8] = {
 };
 
 
+static u16 font_offsets[42][64] __attribute__((section(".ewram")));
+static u8 font_counts[42];
 extern u8 font_pixel_lut[42][8][8]; // Initialized in engine3d.c
 
 static inline int get_font_index(char c) {
@@ -75,10 +77,12 @@ static inline int get_font_index(char c) {
 void init_render(void) {
     // Pre-calculate Font Pixel LUT (unrolls bitwise character checks)
     for (int c = 0; c < 42; c++) {
+        font_counts[c]=0;
         for (int r = 0; r < 8; r++) {
             u8 bits = font_8x8[c][r];
             for (int col = 0; col < 8; col++) {
                 font_pixel_lut[c][r][col] = (bits & (1 << (7 - col))) ? 1 : 0;
+                if(font_pixel_lut[c][r][col])font_offsets[c][font_counts[c]++]=r*240+col;
             }
         }
     }
@@ -403,11 +407,15 @@ IWRAM_CODE void draw_triangle_flat_clipped(int x0, int y0, int x1, int y1, int x
 }
 
 /* --- Font Renderer --- */
-void draw_char(char c, int x, int y, u8 color) {
+IWRAM_CODE void draw_char(char c, int x, int y, u8 color) {
     x /= RENDER_SCALE;
     y /= RENDER_SCALE;
     int idx = get_font_index(c);
-    
+    if(x>=0 && x+7<RENDER_WIDTH && y>=0 && y+7<RENDER_HEIGHT) {
+        u8 *dst=frame_buffer+y*240+x;
+        for(int i=0;i<font_counts[idx];i++)dst[font_offsets[idx][i]]=color;
+        return;
+    }
     for (int r = 0; r < 8; r++) {
         int draw_y = y + r;
         if (draw_y < 0 || draw_y >= RENDER_HEIGHT) continue;
@@ -561,7 +569,7 @@ IWRAM_CODE void draw_triangle_textured_unclipped(int x0, int y0, int u0, int v0,
 // ---------------------------------------------------------
 // TEXTURE MAPPING (Affine, Clipped)
 // ---------------------------------------------------------
-IWRAM_CODE void draw_triangle_textured_clipped(int x0, int y0, int u0, int v0,
+__attribute__((target("arm"),long_call)) void draw_triangle_textured_clipped(int x0, int y0, int u0, int v0,
                                     int x1, int y1, int u1, int v1,
                                     int x2, int y2, int u2, int v2,
                                     const u8 tex[64][64], u8 fallback_color) {

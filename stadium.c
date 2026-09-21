@@ -143,13 +143,21 @@ void draw_stadium_goal(fixed z, fixed w, fixed h, u8 color) {
         (Vector3){w+3*256,h+3*256,z>back?z:back})) return;
     Vector3 front[4]={{-w,0,z},{w,0,z},{w,h,z},{-w,h,z}};
     Vector3 rear[4]={{-w,0,back},{w,0,back},{w,h,back},{-w,h,back}};
+    if(performance_mode==2) {
+        for(int i=1;i<4;i++)draw_world_line(front[i],front[(i+1)&3],130);
+        draw_world_line(front[0],front[1],color);
+        draw_world_line(rear[2],rear[3],color);
+        draw_world_line(front[2],rear[2],color);
+        draw_world_line(front[3],rear[3],color);
+        return;
+    }
     /* Sparse net: eight columns, three rows, plus roof and side tension lines. */
-    for(int i=1;i<8;i++) {
+    for(int i=1;i<8;i+=performance_mode?2:1) {
         fixed x=-w+(2*w*i)/8;
         draw_world_line((Vector3){x,0,back},(Vector3){x,h,back},149);
         draw_world_line((Vector3){x,h,z},(Vector3){x,h,back},149);
     }
-    for(int i=1;i<3;i++) {
+    for(int i=1;i<3;i+=performance_mode?2:1) {
         fixed y=h*i/3;
         draw_world_line((Vector3){-w,y,back},(Vector3){w,y,back},149);
         draw_world_line((Vector3){-w,y,z},(Vector3){-w,y,back},149);
@@ -265,6 +273,27 @@ void draw_stadium_curves(Vector3 camera, fixed width, fixed length, fixed goal_w
         {0,1,3,154},{0,3,2,154},{2,3,5,153},{2,5,4,153},
         {4,5,7,152},{4,7,6,152},{6,7,9,151},{6,9,8,151}
     };
+    if(performance_mode==2) {
+        for(int wall=0;wall<4;wall++) {
+            int endwall=!(wall&1);
+            fixed half=endwall?width:length;
+            for(int strip=0;strip<(endwall?2:1);strip++) {
+                fixed lo=endwall?(strip?goal_width:-half):-half;
+                fixed hi=endwall?(strip?half:-goal_width):half;
+                Vector3 a=wall_point(wall,lo,0,-WALL_CURVE_RADIUS,width,length);
+                Vector3 b=wall_point(wall,hi,0,-WALL_CURVE_RADIUS,width,length);
+                Vector3 c=wall_point(wall,hi,WALL_CURVE_RADIUS,0,width,length);
+                Vector3 d=wall_point(wall,lo,WALL_CURVE_RADIUS,0,width,length);
+                int ax,ay,bx,by,cx,cy,dx,dy;
+                if(project_vertex_world(a,&ax,&ay) && project_vertex_world(b,&bx,&by) &&
+                   project_vertex_world(c,&cx,&cy) && project_vertex_world(d,&dx,&dy)) {
+                    draw_triangle_flat_clipped(ax,ay,bx,by,cx,cy,153);
+                    draw_triangle_flat_clipped(ax,ay,cx,cy,dx,dy,153);
+                } else draw_world_line(a,b,153);
+            }
+        }
+        return;
+    }
     int rebuild=ramp_width!=width || ramp_length!=length || ramp_goal!=goal_width;
     int index=0;
     for(int wall=0;wall<4;wall++) {

@@ -154,8 +154,8 @@ Quiet navigation and confirmation sounds play in menus. Engine and idle sounds
 are removed, including their roughly once-per-second restart. During gameplay,
 boost audio plays only while boosting; jumps, impacts, and goals remain event-based.
 Menu clicks last 0.1 seconds, confirmation cues 0.2 seconds, both at reduced volume.
-Music, pickups, and achievement notifications remain silent. Settings → Sound mutes
-all audio. The eight clips occupy about 103 KiB of ROM with no sample RAM buffer.
+Pickups and achievement notifications remain silent. Settings → Sound mutes
+all audio. The nine clips occupy about 361 KiB of ROM with no sample RAM buffer.
 Impacts retain up to 1.2 seconds and goals their full nearly-six-second tail.
 Build and automated checks pass; emulator/hardware listening remains unverified.
 
@@ -169,3 +169,20 @@ leaving the main menu, and the Sound setting controls it alongside effects.
 Engine/idle sounds remain disabled. Shadows now use neutral grey shades over
 wall ramps, including shadows straddling grass and ramp surfaces. The renderer
 shares its span-fill routine to preserve fast-memory stack headroom.
+
+## Performance update
+
+Fast mode now uses 52-face car meshes (previously 84), flat car shading, projected
+car shadows, and fewer goal-net strands. Detailed mode retains textured cars and
+polygon shadows. ROM instruction prefetch is enabled, and world-line transforms
+run in fast RAM. Arrow-controlled aerial pitch/roll is another 50% faster (9/18
+angle units per simulation update). No physics constants were increased.
+
+`python3 tools/benchmark_fps.py gba_3d.gba` runs a reproducible headless mGBA stress
+scene, measures emulated CPU cycles between presentations, and verifies that the
+scene remains in active gameplay. The test ROM is copied to a temporary directory
+so its save file cannot affect player progress. This scene improved from about
+6.2 FPS to 12.0 FPS, roughly 1.9×. It is not a general gameplay average and does not
+establish 60 FPS: the measured frame cost is still around 1.40 million cycles,
+versus 280,896 cycles for one GBA display refresh. Stable 60 FPS needs further
+renderer work. The on-screen counter continues to report measured performance.

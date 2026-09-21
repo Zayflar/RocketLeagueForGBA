@@ -104,7 +104,7 @@ int main(void) {
     performance_mode=0;
     {
         Car c={0};apply_air_rotation(&c,1,-1);
-        assert(c.visual_pitch==6 && c.visual_roll==244);
+        assert(c.visual_pitch==9 && c.visual_roll==238);
         apply_air_rotation(&c,-1,1);assert(!c.visual_pitch && !c.visual_roll);
         draw_achievements(2);save_preview("achievements.ppm");
         assert(frame_buffer[27*240+83]==131);
@@ -166,10 +166,10 @@ int main(void) {
     /* Camera interpolation takes the short path, without overshoot or stalls. */
     for(int start=0;start<256;start+=8)for(int target=0;target<256;target+=8) {
         int heading=start;
-        for(int step=0;step<64;step++) {
+        for(int step=0;step<128;step++) {
             int next=smooth_camera_heading(heading,target);
             int delta=(next-heading)&255;if(delta>128)delta-=256;
-            assert(abs(delta)<=10);
+            assert(abs(delta)<=4);
             int old=(target-heading)&255;if(old>128)old-=256;
             int remaining=(target-next)&255;if(remaining>128)remaining-=256;
             assert(abs(remaining)<=abs(old));heading=next;

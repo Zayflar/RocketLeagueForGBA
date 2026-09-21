@@ -1,8 +1,8 @@
 # Core gameplay audio
 
-Eight clips imported from the user's RocketLeague-Audio folder cover three ball
+Nine clips imported from the user's RocketLeague-Audio folder cover three ball
 impacts, jumping, goal explosions, quiet menu navigation/confirmation, and boost. Engine, idle, pickup,
-achievement, and music cues have been removed. Source files remain unchanged.
+and achievement cues have been removed. Main-menu music uses the supplied MusicMap 09 clip. Source files remain unchanged.
 
 Regenerate with `python3 tools/import_audio.py [path/to/gba_audio/pcm]` and `make`.
 The goal uses the full 5.96-second source, decoded to the cached development WAV
