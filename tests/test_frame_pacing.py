@@ -1,4 +1,4 @@
-"""Verify hidden-page copying and at most one presentation per VBlank."""
+"""Verify hidden-page copying and steady half-refresh presentation."""
 from pathlib import Path
 import subprocess,tempfile
 source=(Path(__file__).resolve().parents[1]/'render.c').read_text()
@@ -6,7 +6,7 @@ code=source[source.index('static volatile u32 video_frame'):source.index('/* ---
 harness='''#include <stdint.h>
 #include <assert.h>
 #include <stdio.h>
-typedef uintptr_t u32;
+typedef uint32_t u32;
 #define RENDER_HEIGHT 160
 #define DCNT_PAGE 16
 #define DMA_ENABLE (1u<<31)
@@ -25,16 +25,22 @@ static void wait_vblank(void) {
 }
 int main(void) {
     REG_VCOUNT=80;swap_buffers();assert(waits==1 && (REG_DISPCNT&DCNT_PAGE));
-    /* A second fast frame must not present in the same blanking interval. */
-    REG_VCOUNT=180;swap_buffers();assert(waits==2 && !(REG_DISPCNT&DCNT_PAGE));
-    /* Work ending in the next VBlank can flip immediately. */
-    video_vblank();REG_VCOUNT=175;swap_buffers();assert(waits==2);
-    video_vblank();REG_VCOUNT=227;swap_buffers();assert(waits==3);
-    REG_VCOUNT=20;swap_buffers();assert(waits==4);
-    puts("PASS: copy before sync, one flip per VBlank, safe active/late-frame waits");
+    REG_VCOUNT=180;swap_buffers();assert(waits==3 && !(REG_DISPCNT&DCNT_PAGE));
+    /* A completed frame one refresh later waits for its second refresh. */
+    video_vblank();REG_VCOUNT=175;swap_buffers();assert(waits==4);
+    video_vblank();video_vblank();REG_VCOUNT=175;
+    swap_buffers();assert(waits==4);
+    /* Late blanking misses the slot safely; subsequent frames rebase. */
+    video_vblank();video_vblank();REG_VCOUNT=227;
+    swap_buffers();assert(waits==5);
+    REG_VCOUNT=20;swap_buffers();assert(waits==7);
+    /* Unsigned refresh subtraction remains valid across counter wrap. */
+    video_frame=0xfffffffeu;REG_VCOUNT=160;swap_buffers();
+    int before=waits;swap_buffers();assert(waits==before+2 && video_ticks()==0);
+    puts("PASS: hidden-page copy, two-refresh pacing, late-frame recovery, counter wrap");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
     p=Path(tmp);(p/'test.c').write_text(harness)
-    subprocess.run(['cc','-std=c99','-fsanitize=undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
+    subprocess.run(['cc','-std=c99','-fsanitize=undefined','-Wno-pointer-to-int-cast',str(p/'test.c'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)

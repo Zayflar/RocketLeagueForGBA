@@ -7,7 +7,8 @@ with tempfile.TemporaryDirectory() as tmp:
     for name in ('achievements.h','achievements.c','ball_sprite.inc','engine3d.h','engine3d.c','render.h','render.c','models.h','models.c','car_models.inc','stadium.c','stadium.h'):
         s=(Path(os.environ['STADIUM_SOURCE']) if name=='stadium.c' and 'STADIUM_SOURCE' in os.environ else root/name).read_text()
         if name=='engine3d.c':
-            s='long test_vertices,test_faces,test_projections;\n'+s
+            s='int test_disable_flat_fastpath;\nlong test_vertices,test_faces,test_projections;\n'+s
+            s=s.replace('if(render_mode==RENDER_FLAT && model_vertices', 'if(!test_disable_flat_fastpath && render_mode==RENDER_FLAT && model_vertices')
             s=s.replace('int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {','int project_vertex_world(Vector3 world_pos, int *sx, int *sy) { ++test_projections;')
             s=s.replace('    /* Reject unsupported meshes before transforming', '    if(mesh){test_vertices+=mesh->vertex_count;test_faces+=mesh->face_count;}\n    /* Reject unsupported meshes before transforming')
         if name=='engine3d.c' and os.environ.get('STADIUM_PROFILE'):
@@ -77,7 +78,7 @@ static void save_preview(const char *name) {
     }
     fclose(out);
 }
-'''+state+hud+menus+'static int is_hockey_match;\n'+shadows+garage+constants+'\n'+car_code+particle_code+particle_spawn+'''
+'''+ 'static int animation_ticks=2;\n'+state+hud+menus+'static int is_hockey_match;\n'+shadows+garage+constants+'\n'+car_code+particle_code+particle_spawn+'''
 static Car player,opponent;
 static int enable_opponent=1;
 static struct {Vector3 pos,vel;} ball;
@@ -94,6 +95,23 @@ static struct {int boosted,goal_scored;} tutorial_progress;
 '''+pitch_constants+'\n'+pitch+radar+boost_code+physics+ball_physics+collisions+hud_text+match_hud+'''
 int main(void) {
     init_3d_engine(); init_dynamic_models(); init_mesh_normals();
+    /* Compare the flat fast path with the general clipper, including clipped
+       near-camera geometry and off-screen edges through a full rotation. */
+    {
+        extern int test_disable_flat_fastpath;
+        static u8 reference[240*160];
+        performance_mode=2;
+        for(int yaw=0;yaw<256;yaw+=16)for(int distance=12;distance<=160;distance+=37) {
+            set_camera((Vector3){0,8*256,-distance*256},0,0);
+            clear_screen(128);test_disable_flat_fastpath=1;
+            int slow=draw_model_world(car_far_models[0],(Vector3){0,0,0},yaw,0,0,256,3,RENDER_FLAT);
+            memcpy(reference,frame_buffer,sizeof(reference));
+            clear_screen(128);test_disable_flat_fastpath=0;
+            int fast=draw_model_world(car_far_models[0],(Vector3){0,0,0},yaw,0,0,256,3,RENDER_FLAT);
+            assert(fast==slow && !memcmp(reference,frame_buffer,sizeof(reference)));
+        }
+        performance_mode=0;
+    }
     /* Mixed grass/ramp footprint keeps each surface's own shadow tint. */
     for(int i=0;i<12;i++)frame_buffer[i]=i<4?135:i<8?154:SHADOW_RAMP_START+3;
     fast_span_fill(frame_buffer,SHADOW_GRASS_EDGE*0x01010101u,12);
@@ -163,18 +181,35 @@ int main(void) {
         ball.pos=(Vector3){0,BALL_RADIUS,0};ball.vel=(Vector3){0,-64,0};
         update_ball_physics();assert(ball.pos.y==BALL_RADIUS && ball.vel.y==0);
     }
+    /* Bulk horizontal strokes must preserve inclusive endpoints and clipping. */
+    for(int direction=0;direction<2;direction++) for(int y=0;y<160;y+=17) {
+        memset(frame_buffer,0,240*160);
+        draw_line(direction?300:-40,y,direction?-40:300,y,130);
+        for(int row=0;row<160;row++)for(int x=0;x<240;x++)
+            assert(frame_buffer[row*240+x]==(row==y?130:0));
+        memset(frame_buffer,0,240*160);
+        draw_line(direction?117:11,y,direction?11:117,y,130);
+        for(int x=0;x<240;x++)assert(frame_buffer[y*240+x]==(x>=11 && x<=117?130:0));
+    }
     /* Camera interpolation takes the short path, without overshoot or stalls. */
     for(int start=0;start<256;start+=8)for(int target=0;target<256;target+=8) {
-        int heading=start;
-        for(int step=0;step<128;step++) {
+        int heading=start*256;
+        for(int step=0;step<192;step++) {
             int next=smooth_camera_heading(heading,target);
-            int delta=(next-heading)&255;if(delta>128)delta-=256;
-            assert(abs(delta)<=4);
-            int old=(target-heading)&255;if(old>128)old-=256;
-            int remaining=(target-next)&255;if(remaining>128)remaining-=256;
+            int delta=(next-heading)&65535;if(delta>32768)delta-=65536;
+            assert(abs(delta)<=4*256);
+            int old=(target*256-heading)&65535;if(old>32768)old-=65536;
+            int remaining=(target*256-next)&65535;if(remaining>32768)remaining-=65536;
             assert(abs(remaining)<=abs(old));heading=next;
         }
-        assert(heading==target);
+        assert(heading==target*256);
+    }
+    assert(smooth_camera_heading(0,1)>0 && smooth_camera_heading(0,1)<256);
+    for(int angle=0;angle<256;angle++) {
+        assert(camera_sin_q8(angle*256)==custom_sin_lut[angle]);
+        int a=camera_sin_q8(angle*256), b=camera_sin_q8((angle+1)*256);
+        int mid=camera_sin_q8(angle*256+128);
+        assert(abs(mid-(a+b)/2)<=1);
     }
     /* Holding jump extends lift; releasing it permanently ends this boost. */
     {
@@ -357,8 +392,8 @@ int main(void) {
     player=(Car){0};
     /* Gameplay detail levels remain valid and reduce both transforms and faces. */
     for(int model=0;model<3;model++) {
-        const Mesh *levels[3]={car_models[model],car_gameplay_mesh(model,100*100),car_gameplay_mesh(model,300*300)};
-        for(int level=1;level<3;level++) {
+        const Mesh *levels[4]={car_models[model],car_gameplay_mesh(model,100*100),car_gameplay_mesh(model,300*300),car_speed_models[model]};
+        for(int level=1;level<4;level++) {
             const Mesh *mesh=levels[level];
             assert(mesh->vertex_count<levels[level-1]->vertex_count);
             assert(mesh->face_count<levels[level-1]->face_count);
@@ -619,19 +654,19 @@ int main(void) {
     Mesh invalid=*car_models[0]; invalid.vertex_count=1;
     assert(draw_model_world_mat(&invalid,(Vector3){0,0,0},identity,256,3,5)==0);
     /* Compare both playable detail modes at the same camera and positions. */
-    for(int mode=0;mode<2;mode++) {
+    for(int mode=0;mode<3;mode++) {
         performance_mode=mode;active_pitch_mode=0;
         Vector3 camera={0,35*256,-100*256};
         set_camera_lookat(camera,(Vector3){0,15*256,0},0);
         draw_environment_background(128);
-        draw_stadium_crowd(camera,CAGE_WIDTH,CAGE_LENGTH);
+        if(mode!=2)draw_stadium_crowd(camera,CAGE_WIDTH,CAGE_LENGTH);
         draw_soccer_pitch(camera);
         draw_stadium_curves(camera,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
         draw_stadium_goal(STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,131);
-        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,RENDER_TEXTURED);
+        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,mode?RENDER_FLAT:RENDER_TEXTURED);
         draw_soccer_ball((Vector3){25*256,14*256,0},0,0);
         player.boost=74*256;draw_match_hud();
-        save_preview(mode?"fast-mode.ppm":"detailed-mode.ppm");
+        save_preview(mode==2?"speed-mode.ppm":mode?"fast-mode.ppm":"detailed-mode.ppm");
     }
     draw_link_lobby(0,0,0);save_preview("link-lobby.ppm");
     draw_link_lobby(1,1,1);save_preview("link-waiting.ppm");

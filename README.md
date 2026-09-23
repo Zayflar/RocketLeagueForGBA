@@ -172,17 +172,46 @@ shares its span-fill routine to preserve fast-memory stack headroom.
 
 ## Performance update
 
-Fast mode now uses 52-face car meshes (previously 84), flat car shading, projected
+Fast mode now uses 48-face car meshes (previously 84), flat car shading, projected
 car shadows, and fewer goal-net strands. Detailed mode retains textured cars and
 polygon shadows. ROM instruction prefetch is enabled, and world-line transforms
 run in fast RAM. Arrow-controlled aerial pitch/roll is another 50% faster (9/18
 angle units per simulation update). No physics constants were increased.
 
-`python3 tools/benchmark_fps.py gba_3d.gba` runs a reproducible headless mGBA stress
-scene, measures emulated CPU cycles between presentations, and verifies that the
-scene remains in active gameplay. The test ROM is copied to a temporary directory
-so its save file cannot affect player progress. This scene improved from about
-6.2 FPS to 12.0 FPS, roughly 1.9×. It is not a general gameplay average and does not
-establish 60 FPS: the measured frame cost is still around 1.40 million cycles,
-versus 280,896 cycles for one GBA display refresh. Stable 60 FPS needs further
-renderer work. The on-screen counter continues to report measured performance.
+The default **Speed** preset simplifies the field, car meshes, boost pads, ramps,
+and HUD, and omits crowds, netting, and car shadows. Fast and Detailed remain
+available in Settings. Camera headings now ease along the shortest turn, limited
+to four angle units per simulation tick. Both camera easing and the trigonometric
+lookup retain 8 fractional angle bits, avoiding whole-angle stepping at the end
+of turns. Ball-camera direction normalization retains 4.12 precision and pitch
+is interpolated too. Horizontal lines use bulk span writes;
+point drawing and the simplified ramp path run in fast RAM.
+
+`python3 tools/benchmark_fps.py gba_3d.gba --scenario idle` starts a real match
+through the Play menu in headless mGBA. `drive`, `turn`, and `boost` scenarios
+inject held controls after input polling. Each measures 120 frame intervals after
+30 warm-up frames, using emulated CPU cycles. The temporary ROM copy isolates
+player saves. These are short scripted samples, not full-match guarantees.
+
+The car-detail update uses 40-face Speed meshes instead of the previous
+24-face body-only meshes: wheels, rear tyre tread and spoilers are visible again.
+Fast has six-sided wheel silhouettes; all modes have contrasting dark windows.
+Fully projected flat faces bypass UV copying and near-plane clipping, with
+pixel-equivalence checks against the general renderer.
+
+The game now targets **30 FPS** by presenting every two VBlanks. On GBA this
+is **29.86 FPS**. Physics, car rotation, camera easing, replay playback, particles,
+and ball spin advance on fixed hardware-refresh ticks (normally two updates per
+rendered frame). Button presses are consumed once, while held controls continue
+through both updates. This keeps game speed consistent when rendering varies.
+Garage animation uses elapsed ticks too; paused gameplay freezes particles.
+
+Current Speed results, measured at the actual presentation point: idle, drive,
+and boost **29.86 FPS**; turn **29.74 FPS**, including one late frame in the
+120-frame sample. Thus 30 FPS is the target, with occasional heavy-scene misses
+still possible. Each display frame has a 561,792-cycle budget. Fast and Detailed
+can exceed that budget more often. The on-screen FPS counter remains measured.
+
+`python3 tests/test_simulation_timing.py` checks the real ROM in mGBA: two physics
+ticks per ordinary frame, a held jump cannot accidentally consume the double
+jump, a second press can, and the match countdown advances at real-time speed.

@@ -10,6 +10,9 @@ harness='''#include <stdint.h>
 #include <string.h>
 typedef uint8_t u8;typedef uint32_t u32;typedef int32_t fixed;
 #define RENDER_SCALE 1
+#define FP_SCALE 256
+static int performance_mode;
+static int custom_div_lut[2049];
 #define IWRAM_CODE
 static int fills;
 static void fast_span_fill(u8 *dst,u32 color,int count) {++fills;memset(dst,color&255,count);}
@@ -38,6 +41,7 @@ int main(void) {
             for(int i=0;i<100;i++) assert(buffer[i]==colors[(abs(z+i*step)/12288)&1]);
         }
     }
+    for(int i=1;i<=2048;i++)custom_div_lut[i]=65536/i;
     unsigned seed=1;
     for(int i=0;i<200000;i++) {
         seed=seed*1664525u+1013904223u;int x=(int)(seed%1000001)-500000;

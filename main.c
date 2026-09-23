@@ -254,13 +254,14 @@ static int settle_angle(int angle, int *velocity) {
     return (error+step)&255;
 }
 
+/* Camera headings use 8 fractional bits; gameplay headings stay 0..255. */
 static int smooth_camera_heading(int current,int target) {
-    int delta=(target-current)&255;if(delta>128)delta-=256;
+    int delta=((target*256-current+32768)&65535)-32768;
     int step=delta/8;
     if(!step && delta)step=delta>0?1:-1;
-    if(step>4)step=4;
-    if(step<-4)step=-4;
-    return (current+step)&255;
+    if(step>4*256)step=4*256;
+    if(step<-4*256)step=-4*256;
+    return (current+step)&65535;
 }
 
 static void apply_air_rotation(Car *car,int pitch,int roll) {
@@ -322,6 +323,8 @@ static Ball ball;
 static int camera_yaw = 0;
 
 static int measured_fps = 0;
+static int animation_ticks = 1;
+static int ball_spin_y,ball_spin_x;
 static int score_blue = 0;
 static int score_orange = 0;
 static int match_timer = 120 * 60; // 2 minutes in frames (60 fps)
@@ -515,7 +518,7 @@ void draw_soccer_pitch(Vector3 cam_pos) {
         draw_world_line((Vector3){-2*FP_SCALE,0,0},(Vector3){2*FP_SCALE,0,0},line_color);
         for(int side=-1;side<=1;side+=2) {
             fixed end=side*STADIUM_LENGTH;
-            for(int area=0;area<(performance_mode==2?1:2);area++) {
+            for(int area=0;area<(performance_mode==2?0:2);area++) {
                 fixed width=(area?110:150)*FP_SCALE;
                 fixed front=end-side*(area?24:50)*FP_SCALE;
                 Vector3 left={-width,0,end},left_front={-width,0,front};
@@ -877,7 +880,7 @@ static void spawn_goal_celebration(Vector3 pos, u8 team_color) {
     }
 }
 
-void update_and_draw_particles(void) {
+void update_particles(void) {
     for (int i = 0; i < MAX_PARTICLES; i++) {
         if (particles[i].life > 0) {
             particles[i].life--;
@@ -888,6 +891,13 @@ void update_and_draw_particles(void) {
             particles[i].pos.y += particles[i].vel.y;
             particles[i].pos.z += particles[i].vel.z;
             
+        }
+    }
+}
+
+void draw_particles(void) {
+    for(int i=0;i<MAX_PARTICLES;i++) {
+        if(particles[i].life>0) {
             int sx, sy;
             if (project_vertex_world(particles[i].pos, &sx, &sy)) {
                 draw_point(sx, sy, particles[i].color);
@@ -997,7 +1007,7 @@ void reset_kickoff(void) {
     player.visual_pitch = 0;
     player.visual_roll = 0;
     player.flip_timer = player.boost_requested = 0;
-    camera_yaw = link_match && link_player_id()==1 ? 128 : 0;  // Local kickoff heading
+    camera_yaw = link_match && link_player_id()==1 ? 128*256 : 0;  // Local kickoff heading
 
     // Reset Opponent (Orange team) at north kickoff spot facing South (yaw = 128)
     opponent.pos.x = 0;
@@ -1077,7 +1087,7 @@ static void setup_tutorial_stage(void) {
     ball.vel.y = 0;
     /* Stationary ball ahead of the car makes the first shot easy to line up. */
     ball.vel.z = 0;
-    camera_yaw = player.yaw;
+    camera_yaw = player.yaw*256;
 
     player.boost_requested = 0;
     cam_mode = 0;
@@ -1813,7 +1823,7 @@ static void fast_draw_boost(int pct, int x, int y) {
     if(pct<0) pct=0;
     if(pct>100) pct=100;
     u8 fuel_color=pct<20?28:131;
-    for(int i=0;i<25;i++) {
+    for(int i=0;i<25;i+=performance_mode==2?2:1) {
         int angle=(160+i*8)&255;
         u8 color=i*100<pct*25?fuel_color:149;
         int sx=custom_sin_fp[angle], sy=custom_cos_fp[angle];
@@ -1871,9 +1881,10 @@ static void draw_match_hud(void) {
     fast_draw_team_score("ORA", score_orange, 152, 4, 131);
     draw_line(40,15,87,15,146);draw_line(152,15,199,15,131);
 
-    fast_draw_speed(FP_TO_INT(abs(player.speed) * 35), 62, 147, 130);
+    if(performance_mode!=2)fast_draw_speed(FP_TO_INT(abs(player.speed) * 35), 62, 147, 130);
     fast_draw_boost(boost_pct, 212, 136);
 
+    if(performance_mode==2)return;
     if (game_state == STATE_REPLAY) {
         draw_hud_text("REPLAY", 62, 134, 131);
     } else if (cam_mode == 0) {
@@ -1972,8 +1983,8 @@ static void draw_tutorial_arrow(void) {
     /* --- Arrow math (no trig needed: use camera-relative dx/dz) ---------- */
     /* The camera faces the same direction as the player yaw.
        Project world dx/dz into camera-space left/up components.            */
-    fixed cam_cos = custom_cos_fp[camera_yaw & 255]; /* camera forward Z component */
-    fixed cam_sin = custom_sin_fp[camera_yaw & 255]; /* camera forward X component */
+    fixed cam_cos = (camera_cos_q8(camera_yaw)>>4); /* camera forward Z component */
+    fixed cam_sin = (camera_sin_q8(camera_yaw)>>4); /* camera forward X component */
 
     /* Camera-space right = (cos, -sin), forward = (-sin, -cos)
        We want screen-X = right dot (dx,dz), screen-Y = -forward dot (dx,dz) */
@@ -2070,7 +2081,7 @@ static void draw_garage(void) {
     Vector3 origin = { 0, 0, 0 };
     set_camera_lookat(eye, focus, 0);
     draw_model_world(car_models[garage_model[garage_side]], origin,
-                     (spin++ / 3) & 255, 0, 0, FP_ONE,
+                     ((spin+=animation_ticks) / 3) & 255, 0, 0, FP_ONE,
                      team_paints[garage_side][garage_paint[garage_side]], RENDER_TEXTURED);
     if(garage_row==2) draw_goal_effect(120,72,(spin%120)*96/120,
         garage_goal[garage_side],garage_side?131:146,23);
@@ -2385,9 +2396,8 @@ int main(void) {
 
     while (1) {
         key_poll();
-        stadium_light_phase = (stadium_light_phase + 1) & 255;
 
-        // Compute elapsed real-time frames (dt_time_frames) for match clocks
+        // Measure delivered FPS against the independent hardware timer.
         static u16 last_tm0 = 0;
         u16 current_tm0 = REG_TM0D;
         u16 dt_ticks = current_tm0 - last_tm0;
@@ -2400,10 +2410,14 @@ int main(void) {
             fps_ticks=0;fps_frames=0;
         }
 
-        static u32 timer_accumulator = 0;
-        timer_accumulator += dt_ticks;
-        int dt_time_frames = timer_accumulator / 273; // 16384 ticks / 60 frames = ~273 ticks per frame
-        timer_accumulator %= 273;
+        /* One simulation tick per hardware refresh, independent of rendering.
+           Normal 30 FPS frames contain two small physics updates. */
+        static u32 previous_video_tick=0;
+        u32 current_video_tick=video_ticks();
+        int dt_time_frames=(int)(current_video_tick-previous_video_tick);
+        previous_video_tick=current_video_tick;
+        if(dt_time_frames<1)dt_time_frames=1;
+        if(dt_time_frames>4)dt_time_frames=4; /* bounded recovery after a stall */
 
         int network_step=1;
         if(link_match) {
@@ -2415,6 +2429,16 @@ int main(void) {
                 link_waiting=!network_step;
             }
         }
+        int simulation_steps=dt_time_frames;
+        if(simulation_steps<1)simulation_steps=1;
+        if(simulation_steps>4)simulation_steps=4;
+        animation_ticks=simulation_steps;
+        u16 first_key_previous=__key_prev;
+        for(int simulation_step=0;simulation_step<simulation_steps;simulation_step++) {
+        /* Held controls apply every tick; presses apply only on the first. */
+        if(simulation_step)__key_prev=__key_curr;
+        dt_time_frames=1;
+        stadium_light_phase=(stadium_light_phase+1)&255;
         // 1. STATE MACHINE UPDATES
         if(game_state<=STATE_MENU_LINK) {
             if(key_hit(KEY_A|KEY_START|KEY_B))audio_play(AUDIO_SELECT);
@@ -2500,7 +2524,7 @@ int main(void) {
                         enable_opponent=1;link_match=1;
                         link_buttons[0]=link_buttons[1]=link_previous[0]=link_previous[1]=0;
                         srand(1);reset_match();
-                        camera_yaw=link_player_id()?128:0;
+                        camera_yaw=link_player_id()?128*256:0;
                     }
                 }
                 break;
@@ -2775,7 +2799,7 @@ int main(void) {
                 training_timer = 0;
                 training_touches = 0;
                 training_post_touch_timer = 0;
-                camera_yaw = player.yaw;
+                camera_yaw = player.yaw*256;
                 game_state = STATE_TRAINING;
                 break;
 
@@ -2897,6 +2921,13 @@ int main(void) {
             if(achievement_toast>=0)achievement_toast_timer=150;
         }
         if(link_match && network_step){link_previous[0]=link_buttons[0];link_previous[1]=link_buttons[1];}
+        if(network_step && game_state>STATE_MENU_LINK && game_state!=STATE_PAUSED) {
+            update_particles();
+            ball_spin_y=(ball_spin_y+(ball.vel.x>>7))&255;
+            ball_spin_x=(ball_spin_x+(ball.vel.z>>7))&255;
+        }
+        } /* fixed simulation ticks */
+        __key_prev=first_key_previous;
         /* Simulation always runs blue then orange. Only the presentation swaps
            on console 2, so collisions and pad pickups have identical ordering. */
         int swapped_view=link_match && link_player_id()==1;
@@ -2930,10 +2961,10 @@ int main(void) {
             } else if (cam_mode == 0) {
                 ball_cam_yaw=camera_yaw;
                 /* Pull back 10% so the entire car stays visible on approach. */
-                fixed c_dir_x = custom_sin_fp[camera_yaw & 255];
-                fixed c_dir_z = custom_cos_fp[camera_yaw & 255];
-                cam_pos.x = player.pos.x - c_dir_x * 132 + camera_shake_x * FP_SCALE;
-                cam_pos.z = player.pos.z - c_dir_z * 132 + camera_shake_y * FP_SCALE;
+                fixed c_dir_x = camera_sin_q8(camera_yaw);
+                fixed c_dir_z = camera_cos_q8(camera_yaw);
+                cam_pos.x = player.pos.x - ((c_dir_x * 132)>>4) + camera_shake_x * FP_SCALE;
+                cam_pos.z = player.pos.z - ((c_dir_z * 132)>>4) + camera_shake_y * FP_SCALE;
                 cam_pos.y = player.pos.y + (31 * FP_SCALE);
                 cam_pitch = -11;
                 cam_yaw   = camera_yaw;
@@ -2946,7 +2977,7 @@ int main(void) {
                     if(cam_pos.z<-STADIUM_LENGTH+12*256)cam_pos.z=-STADIUM_LENGTH+12*256;
                     Vector3 target=player.pos;target.y+=8*256;
                     set_camera_lookat(cam_pos,target,0);
-                } else set_camera(cam_pos, cam_yaw, cam_pitch);
+                } else set_camera_q8(cam_pos, cam_yaw, cam_pitch*256);
             } else {
                 /* --- Improved Ball-cam ---
                  * Smoothly orbits behind the player while always looking at the ball.
@@ -2962,10 +2993,11 @@ int main(void) {
 
                 /* Avoid abrupt half-turns when the ball crosses the car. */
                 if(abs(dx_b)+abs(dz_b)>8*FP_SCALE)
-                    ball_cam_yaw=smooth_camera_heading(ball_cam_yaw,target_yaw);
+                    for(int step=0;step<simulation_steps;step++)
+                        ball_cam_yaw=smooth_camera_heading(ball_cam_yaw,target_yaw);
 
-                fixed bdir_x = custom_sin_fp[ball_cam_yaw & 255];
-                fixed bdir_z = custom_cos_fp[ball_cam_yaw & 255];
+                fixed bdir_x = camera_sin_q8(ball_cam_yaw);
+                fixed bdir_z = camera_cos_q8(ball_cam_yaw);
 
                 /* Keep enough distance to frame the whole car, even when the
                    ball is directly in front of its bumper. */
@@ -2974,8 +3006,8 @@ int main(void) {
                 int cam_dist = 70 + (horiz_dist >> 3);
                 if (cam_dist > 120) cam_dist = 120;
 
-                cam_pos.x = player.pos.x - (bdir_x * cam_dist) + camera_shake_x * FP_SCALE;
-                cam_pos.z = player.pos.z - (bdir_z * cam_dist) + camera_shake_y * FP_SCALE;
+                cam_pos.x = player.pos.x - ((bdir_x * cam_dist)>>4) + camera_shake_x * FP_SCALE;
+                cam_pos.z = player.pos.z - ((bdir_z * cam_dist)>>4) + camera_shake_y * FP_SCALE;
 
                 /* Dynamic height: lower when ball is high to look UP at it */
                 int ball_h = FP_TO_INT(ball.pos.y);
@@ -3001,7 +3033,7 @@ int main(void) {
             memcpy32(frame_buffer, coverart_data, 38400 / 4);
             
             // Flashing "PRESS START TO PLAY"
-            if ((timer_accumulator / 15) & 1) { 
+            if ((current_video_tick / 30) & 1) { 
                 draw_string("PRESS START TO PLAY", 50, 140, 130);
             }
         } else if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_LINK)) {
@@ -3019,7 +3051,7 @@ int main(void) {
             if(performance_mode!=2)draw_stadium_floodlights();
 
             // Draw Shadows
-            draw_car_shadow(player.pos, player.yaw, garage_model[player.team==6]);
+            if(performance_mode!=2)draw_car_shadow(player.pos, player.yaw, garage_model[player.team==6]);
             if (performance_mode!=2 && enable_opponent && game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
                 draw_car_shadow(opponent.pos, opponent.yaw, garage_model[opponent.team==6]);
             }
@@ -3095,6 +3127,15 @@ int main(void) {
 
                 u8 pad_col = (boost_pads[i].amount == 100) ? 131 : 129; // Orange for 100, Cyan for 12
 
+                if(performance_mode==2) {
+                    int sx,sy;
+                    if(project_vertex_world(boost_pads[i].pos,&sx,&sy)) {
+                        u8 color=boost_pads[i].cooldown?149:pad_col;
+                        draw_line(sx-3,sy,sx+3,sy,color);
+                        draw_line(sx,sy-1,sx,sy+1,color);
+                    }
+                    continue;
+                }
                 if (dist_sq <= 140 * 140) {
                     /* NEAR PAD: Draw wireframe circle on the playground floor */
                     u8 ring_col = (boost_pads[i].cooldown > 0) ? 128 : pad_col; // Grey if empty, colored if full
@@ -3212,10 +3253,6 @@ int main(void) {
             }
             
             // Render Soccer Ball Spin Prep
-            static int ball_spin_y = 0;
-            static int ball_spin_x = 0;
-            ball_spin_y = (ball_spin_y + (ball.vel.x >> 7)) & 255;
-            ball_spin_x = (ball_spin_x + (ball.vel.z >> 7)) & 255;
 
             // Draw objects in sorted order
             for (int i = 0; i < 3; i++) {
@@ -3243,7 +3280,7 @@ int main(void) {
             }
             
             // Draw Boost Particles
-            update_and_draw_particles();
+            draw_particles();
             
             // Draw Minimap Radar (big when SELECT held)
             if (key_is_down(KEY_SELECT) && game_state != STATE_PAUSED && game_state != STATE_TUTORIAL) {

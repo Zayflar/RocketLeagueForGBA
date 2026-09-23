@@ -292,11 +292,7 @@ static Vector3 far_ball_normals[20] EWRAM_MODEL_DATA;
 static Mesh far_ball_mesh = {"DISTANT_BALL",12,20,sphere_verts,far_ball_faces,far_ball_normals};
 
 const Mesh *car_gameplay_mesh(int model, int distance_sq) {
-    if(performance_mode==2) {
-        static Mesh speed[3];
-        if(!speed[model].vertices) {speed[model]=*car_far_models[model];speed[model].vertex_count=16;speed[model].face_count=24;}
-        return &speed[model];
-    }
+    if(performance_mode==2)return car_speed_models[model];
     return performance_mode || distance_sq > 240*240 ? car_far_models[model] : car_match_models[model];
 }
 const Mesh *ball_gameplay_mesh(int distance_sq) {
@@ -537,6 +533,8 @@ void init_mesh_normals(void) {
     compute_normals(rover_vertices, rover_faces, rover_mesh.face_count, rover_normals);
     for (int model=0;model<CAR_MODEL_COUNT;model++) {
         const Mesh *near=car_match_models[model], *far=car_far_models[model];
+        const Mesh *speed=car_speed_models[model];
+        compute_normals(speed->vertices,speed->faces,speed->face_count,(Vector3 *)speed->face_normals);
         compute_normals(near->vertices,near->faces,near->face_count,(Vector3 *)near->face_normals);
         compute_normals(far->vertices,far->faces,far->face_count,(Vector3 *)far->face_normals);
     }

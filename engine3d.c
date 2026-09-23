@@ -779,13 +779,20 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
 }
 
 /* --- Camera and World-Space Pipeline Implementation --- */
-void set_camera(Vector3 pos, int yaw, int pitch) {
-    camera_pos = pos;
-    
-    cam_cos_y = custom_cos_lut[yaw & 255];
-    cam_sin_y = custom_sin_lut[yaw & 255];
-    cam_cos_x = custom_cos_lut[pitch & 255];
-    cam_sin_x = custom_sin_lut[pitch & 255];
+/* Interpolate the existing trig table: smooth camera motion without floats. */
+int camera_sin_q8(int angle) {
+    int index=(angle>>8)&255, fraction=angle&255;
+    int a=custom_sin_lut[index],b=custom_sin_lut[(index+1)&255];
+    return a+((b-a)*fraction)/256;
+}
+int camera_cos_q8(int angle) {return camera_sin_q8(angle+64*256);}
+void set_camera(Vector3 pos,int yaw,int pitch) {
+    set_camera_q8(pos,yaw*256,pitch*256);
+}
+void set_camera_q8(Vector3 pos,int yaw,int pitch) {
+    camera_pos=pos;
+    cam_cos_y=camera_cos_q8(yaw);cam_sin_y=camera_sin_q8(yaw);
+    cam_cos_x=camera_cos_q8(pitch);cam_sin_x=camera_sin_q8(pitch);
 
     // Precompute Camera Matrix Components (4.12 fixed point)
     cam_m00 = cam_cos_y;
@@ -810,23 +817,23 @@ void set_camera_lookat(Vector3 pos, Vector3 target, int pitch) {
     int32_t len = int_sqrt(len_sq);
     
     if (len > 0) {
-        fixed dir_x = (dx_s * 256) / len;
-        fixed dir_z = (dz_s * 256) / len;
+        fixed dir_x = (dx_s * 4096) / len;
+        fixed dir_z = (dz_s * 4096) / len;
         
-        cam_cos_y = dir_z * 16;
-        cam_sin_y = dir_x * 16;
+        cam_cos_y = dir_z;
+        cam_sin_y = dir_x;
         
         /* Auto-compute pitch to look up/down at the target. */
         fixed dy = target.y - pos.y;
-        pitch = (dy * 41) / (len * 16);
+        pitch = (int)(((int64_t)dy * 41 * 256) / (len * 16));
     } else {
         cam_cos_y = 4096;
         cam_sin_y = 0;
         pitch = 0;
     }
     
-    cam_cos_x = custom_cos_lut[pitch & 255];
-    cam_sin_x = custom_sin_lut[pitch & 255];
+    cam_cos_x = camera_cos_q8(pitch);
+    cam_sin_x = camera_sin_q8(pitch);
 
     cam_m00 = cam_cos_y;
     cam_m02 = -cam_sin_y;
@@ -1197,6 +1204,21 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
         u8 base_col = (color_override >= 0 && f.base_color <= 7)
             ? (u8)color_override : f.base_color;
         u8 color = material_shade(base_col, intensity);
+
+        /* The sorting pass already culled fully projected faces. Flat cars
+           need neither UV copying nor the general near-plane clipper here. */
+        if(render_mode==RENDER_FLAT && model_vertices[f.v1].z>NEAR_PLANE &&
+           model_vertices[f.v2].z>NEAR_PLANE && model_vertices[f.v3].z>NEAR_PLANE) {
+            int x0=screen_x[f.v1],y0=screen_y[f.v1];
+            int x1=screen_x[f.v2],y1=screen_y[f.v2];
+            int x2=screen_x[f.v3],y2=screen_y[f.v3];
+            if((unsigned)x0<240 && (unsigned)x1<240 && (unsigned)x2<240 &&
+               (unsigned)y0<160 && (unsigned)y1<160 && (unsigned)y2<160)
+                draw_triangle_flat_unclipped(x0,y0,x1,y1,x2,y2,color);
+            else draw_triangle_flat_clipped(x0,y0,x1,y1,x2,y2,color);
+            visible_faces++;
+            continue;
+        }
 
         /* --- Near-plane clipping --- */
         ClipV cv0 = { model_vertices[f.v1].x, model_vertices[f.v1].y, model_vertices[f.v1].z, f.uv[0][0], f.uv[0][1] };

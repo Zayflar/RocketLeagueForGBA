@@ -261,6 +261,26 @@ int stadium_surface_contact(Vector3 *pos, fixed radius, fixed tolerance,
 static Vector3 ramp_near[6][18] __attribute__((section(".ewram"),aligned(4)));
 static Vector3 ramp_far[6][10] __attribute__((section(".ewram"),aligned(4)));
 static fixed ramp_width,ramp_length,ramp_goal;
+static IWRAM_CODE __attribute__((noinline)) void draw_speed_curves(fixed width, fixed length, fixed goal_width) {
+    for(int wall=0;wall<4;wall++) {
+        int endwall=!(wall&1);
+        fixed half=endwall?width:length;
+        for(int strip=0;strip<(endwall?2:1);strip++) {
+            fixed lo=endwall?(strip?goal_width:-half):-half;
+            fixed hi=endwall?(strip?half:-goal_width):half;
+            Vector3 a=wall_point(wall,lo,0,-WALL_CURVE_RADIUS,width,length);
+            Vector3 b=wall_point(wall,hi,0,-WALL_CURVE_RADIUS,width,length);
+            Vector3 c=wall_point(wall,hi,WALL_CURVE_RADIUS,0,width,length);
+            Vector3 d=wall_point(wall,lo,WALL_CURVE_RADIUS,0,width,length);
+            int ax,ay,bx,by,cx,cy,dx,dy;
+            if(project_vertex_world(a,&ax,&ay) && project_vertex_world(b,&bx,&by) &&
+               project_vertex_world(c,&cx,&cy) && project_vertex_world(d,&dx,&dy)) {
+                draw_triangle_flat_clipped(ax,ay,bx,by,cx,cy,153);
+                draw_triangle_flat_clipped(ax,ay,cx,cy,dx,dy,153);
+            } else draw_world_line(a,b,153);
+        }
+    }
+}
 void draw_stadium_curves(Vector3 camera, fixed width, fixed length, fixed goal_width) {
     static const int32_t identity[9]={4096,0,0,0,4096,0,0,0,4096};
     static const Face near_faces[16]={
@@ -273,27 +293,7 @@ void draw_stadium_curves(Vector3 camera, fixed width, fixed length, fixed goal_w
         {0,1,3,154},{0,3,2,154},{2,3,5,153},{2,5,4,153},
         {4,5,7,152},{4,7,6,152},{6,7,9,151},{6,9,8,151}
     };
-    if(performance_mode==2) {
-        for(int wall=0;wall<4;wall++) {
-            int endwall=!(wall&1);
-            fixed half=endwall?width:length;
-            for(int strip=0;strip<(endwall?2:1);strip++) {
-                fixed lo=endwall?(strip?goal_width:-half):-half;
-                fixed hi=endwall?(strip?half:-goal_width):half;
-                Vector3 a=wall_point(wall,lo,0,-WALL_CURVE_RADIUS,width,length);
-                Vector3 b=wall_point(wall,hi,0,-WALL_CURVE_RADIUS,width,length);
-                Vector3 c=wall_point(wall,hi,WALL_CURVE_RADIUS,0,width,length);
-                Vector3 d=wall_point(wall,lo,WALL_CURVE_RADIUS,0,width,length);
-                int ax,ay,bx,by,cx,cy,dx,dy;
-                if(project_vertex_world(a,&ax,&ay) && project_vertex_world(b,&bx,&by) &&
-                   project_vertex_world(c,&cx,&cy) && project_vertex_world(d,&dx,&dy)) {
-                    draw_triangle_flat_clipped(ax,ay,bx,by,cx,cy,153);
-                    draw_triangle_flat_clipped(ax,ay,cx,cy,dx,dy,153);
-                } else draw_world_line(a,b,153);
-            }
-        }
-        return;
-    }
+    if(performance_mode==2) {draw_speed_curves(width,length,goal_width);return;}
     int rebuild=ramp_width!=width || ramp_length!=length || ramp_goal!=goal_width;
     int index=0;
     for(int wall=0;wall<4;wall++) {

@@ -14,6 +14,11 @@
 #define IWRAM_CODE __attribute__((section(".iwram"), target("arm"), long_call))
 
 #include "render.h"
+#ifdef __arm__
+#define ROM_ARM_CODE __attribute__((target("arm"),long_call))
+#else
+#define ROM_ARM_CODE
+#endif
 
 /* --- Fixed-Point Math Definitions (8.8 format) --- */
 typedef int32_t fixed;
@@ -114,6 +119,9 @@ int draw_model(const Mesh *mesh, int angle_x, int angle_y, fixed scale, fixed z_
 /**
  * @brief Set the 3D camera position and orientation in the world.
  */
+int camera_sin_q8(int angle);
+int camera_cos_q8(int angle);
+void set_camera_q8(Vector3 pos, int yaw, int pitch);
 void set_camera(Vector3 pos, int yaw, int pitch);
 void set_camera_lookat(Vector3 pos, Vector3 target, int pitch);
 

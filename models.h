@@ -16,6 +16,7 @@ extern Mesh spaceship_mesh;
 extern const Mesh *const car_models[CAR_MODEL_COUNT];
 extern const Mesh *const car_match_models[CAR_MODEL_COUNT];
 extern const Mesh *const car_far_models[CAR_MODEL_COUNT];
+extern const Mesh *const car_speed_models[CAR_MODEL_COUNT];
 const Mesh *car_gameplay_mesh(int model, int distance_sq);
 const Mesh *ball_gameplay_mesh(int distance_sq);
 /* Keep the mesh bounds center fixed while pitching/rolling around a yawed car. */

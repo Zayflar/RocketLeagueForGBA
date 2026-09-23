@@ -96,6 +96,10 @@ void clear_screen(u8 color) {
 
 static volatile u32 video_frame;
 void video_vblank(void) { ++video_frame; }
+u32 video_ticks(void) {return video_frame;}
+
+/* Separate presentation point also permits cycle-accurate pacing measurements. */
+static __attribute__((noinline)) void present_frame(void) {REG_DISPCNT ^= DCNT_PAGE;}
 
 void swap_buffers(void) {
     static u32 last_present_frame=0xffffffffu;
@@ -105,12 +109,12 @@ void swap_buffers(void) {
     REG_DMA3DAD = back_buffer;
     REG_DMA3CNT = ((240 * RENDER_HEIGHT) / 4) | DMA_ENABLE | DMA_32;
     
-    /* DMA writes only the hidden page. Finish it before waiting, and reuse
-       the current blanking interval when there is still room to flip safely. */
-    int scanline=REG_VCOUNT;
-    if(scanline<160 || scanline>225 || video_frame==last_present_frame) VBlankIntrWait();
+    /* Present every two VBlanks (~29.86 Hz), after the hidden-page DMA.
+       If rendering misses its slot, wait for a safe blank and rebase there. */
+    while((last_present_frame!=0xffffffffu && video_frame-last_present_frame<2) ||
+          REG_VCOUNT<160 || REG_VCOUNT>225) VBlankIntrWait();
     last_present_frame=video_frame;
-    REG_DISPCNT ^= DCNT_PAGE;
+    present_frame();
 }
 
 /* --- Fast 32-bit Word Span Filler --- */
@@ -176,7 +180,7 @@ IWRAM_CODE void fast_span_fill(u8 *dst, u32 color4, int count) {
 }
 
 /* --- Line and Point Drawing --- */
-void draw_point(int x, int y, u8 color) {
+IWRAM_CODE void draw_point(int x, int y, u8 color) {
     if (x >= 0 && x < RENDER_WIDTH && y >= 0 && y < RENDER_HEIGHT) {
         frame_buffer[y * 240 + x] = color;
     }
@@ -246,6 +250,15 @@ IWRAM_CODE void draw_line(int x0, int y0, int x1, int y1, u8 color) {
     }
 
     if (!accept) return; // Entire line was clipped outside
+
+    /* Pitch rails and HUD strokes often span a whole scanline. Use word
+       stores instead of visiting each pixel with the general line loop. */
+    if(y0==y1) {
+        int left=x0<x1?x0:x1;
+        int right=x0>x1?x0:x1;
+        fast_span_fill(frame_buffer+y0*240+left,color*0x01010101u,right-left+1);
+        return;
+    }
 
     // Fast Bresenham without bounds checking since the line is guaranteed to be within [0, RENDER_WIDTH) x [0, RENDER_HEIGHT)
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -569,7 +582,7 @@ IWRAM_CODE void draw_triangle_textured_unclipped(int x0, int y0, int u0, int v0,
 // ---------------------------------------------------------
 // TEXTURE MAPPING (Affine, Clipped)
 // ---------------------------------------------------------
-__attribute__((target("arm"),long_call)) void draw_triangle_textured_clipped(int x0, int y0, int u0, int v0,
+ROM_ARM_CODE void draw_triangle_textured_clipped(int x0, int y0, int u0, int v0,
                                     int x1, int y1, int u1, int v1,
                                     int x2, int y2, int u2, int v2,
                                     const u8 tex[64][64], u8 fallback_color) {

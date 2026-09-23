@@ -18,6 +18,7 @@ preamble = r'''
 typedef uint8_t u8;
 typedef int32_t fixed;
 #define FP_SCALE 256
+#define ROM_ARM_CODE
 #define IWRAM_CODE
 #define RENDER_WIDTH 240
 #define RENDER_HEIGHT 160

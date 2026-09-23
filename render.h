@@ -42,6 +42,7 @@ void clear_screen(u8 color);
  */
 void swap_buffers(void);
 void video_vblank(void);
+u32 video_ticks(void);
 
 /**
  * @brief Draw a 2x2 point on the screen (scaled automatically by RENDER_SCALE).
