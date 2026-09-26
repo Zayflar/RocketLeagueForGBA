@@ -35,8 +35,8 @@ When running in an emulator (e.g., **mGBA**), the following inputs control your 
 | **D-Pad Left/Right**| `Q` / `D` | Steer Car Left / Right |
 | **A Button** | `K` | Jump (Vertical boost jump) |
 | **B Button** | `L` | Consume rocket fuel to **BOOST** (spawns particles) |
-| **L Shoulder** | `M` | (Unbound) |
-| **R Shoulder** | `Ù` | Look Behind (Rearview camera) |
+| **L Shoulder** | `M` | Switch chase / ball camera |
+| **R Shoulder** | `Ù` | Hold to drift on ground / control pitch and roll in air |
 | **Start** | `Enter` | Start match / Play again (Title/Game Over screens) |
 
 ---
@@ -126,7 +126,7 @@ packets. A physical two-GBA / linked-emulator playtest is still required.
 
 ## Controls and achievements
 
-Holding R for aerial control rotates pitch and roll 50% faster. The hockey puck
+Holding R provides slower, more controlled aerial pitch and roll. The hockey puck
 slides with less drag, rests at its actual half-height, and has a low ice bounce.
 Achievements is a six-column, four-row icon grid with 24 unlockable challenges.
 Use the arrows to select an icon; its name, objective, and progress appear below.
@@ -175,13 +175,19 @@ shares its span-fill routine to preserve fast-memory stack headroom.
 Fast mode now uses 48-face car meshes (previously 84), flat car shading, projected
 car shadows, and fewer goal-net strands. Detailed mode retains textured cars and
 polygon shadows. ROM instruction prefetch is enabled, and world-line transforms
-run in fast RAM. Arrow-controlled aerial pitch/roll is another 50% faster (9/18
-angle units per simulation update). No physics constants were increased.
+run in fast RAM. Aerial pitch/roll use 4/5 angle units per simulation update,
+reduced to 3/4 for diagonal input. Steering builds progressively, gets gentler
+at higher speed, and stops on release. Ground grip removes unwanted sideways
+momentum; braking also slows boost momentum. Drift adds a smaller controlled
+slide. Classic uses R for drift and L exclusively for the camera; Alternative
+uses Select for drift, with the full-screen map suppressed while driving.
+Flips take 17 updates (about 0.57 seconds) instead of 9, without increasing
+their total impulse.
 
 The default **Speed** preset simplifies the field, car meshes, boost pads, ramps,
 and HUD, and omits crowds, netting, and car shadows. Fast and Detailed remain
 available in Settings. Camera headings now ease along the shortest turn, limited
-to four angle units per simulation tick. Both camera easing and the trigonometric
+to three angle units per simulation tick. Both camera easing and the trigonometric
 lookup retain 8 fractional angle bits, avoiding whole-angle stepping at the end
 of turns. Ball-camera direction normalization retains 4.12 precision and pitch
 is interpolated too. Horizontal lines use bulk span writes;
@@ -200,18 +206,108 @@ Fully projected flat faces bypass UV copying and near-plane clipping, with
 pixel-equivalence checks against the general renderer.
 
 The game now targets **30 FPS** by presenting every two VBlanks. On GBA this
-is **29.86 FPS**. Physics, car rotation, camera easing, replay playback, particles,
-and ball spin advance on fixed hardware-refresh ticks (normally two updates per
-rendered frame). Button presses are consumed once, while held controls continue
-through both updates. This keeps game speed consistent when rendering varies.
-Garage animation uses elapsed ticks too; paused gameplay freezes particles.
+is **29.86 FPS**. Gameplay now runs at **50% of the original speed**: one fixed
+simulation update per two hardware refreshes, one-third slower than the prior
+75% build. Cars, ball movement, jumps,
+rotations, replay playback and particles slow together, preserving collision
+behaviour. Rendering shows the latest positions, car rotation matrices, camera
+heading and ball spin on each frame. Blended rotation matrices are
+re-orthonormalized so the car does not shrink or shear between poses. Speed mode
+uses a high-precision reciprocal table with fractional-depth interpolation,
+plus exact projection near the camera, avoiding whole-depth jumps. Interpolated states never enter physics.
 
-Current Speed results, measured at the actual presentation point: idle, drive,
-and boost **29.86 FPS**; turn **29.74 FPS**, including one late frame in the
-120-frame sample. Thus 30 FPS is the target, with occasional heavy-scene misses
-still possible. Each display frame has a 561,792-cycle budget. Fast and Detailed
-can exceed that budget more often. The on-screen FPS counter remains measured.
+Match countdowns, menus and UI timing stay real-time. Pressed controls are
+consumed once; held controls continue through all simulation updates. Paused
+gameplay freezes particles.
 
-`python3 tests/test_simulation_timing.py` checks the real ROM in mGBA: two physics
-ticks per ordinary frame, a held jump cannot accidentally consume the double
+Speed and Fast texture the local car hood/roof and glass panels while leaving
+other faces flat (Speed keeps the opponent flat shaded to preserve frame time); very close cars fall back to flat shading to limit raster cost.
+The atlas has cleaner vents, reflective blue glass and diagonal tyre tread.
+Speed's pitch uses a low-contrast grass weave and eight sky bands, all drawn
+with bulk word fills instead of per-pixel ground sampling.
+
+Current Speed results, measured at the actual presentation point: drive
+**29.74 FPS**, boost and turn **29.86 FPS**. Occasional late frames remain possible;
+these are short scripted samples, not a guarantee of every gameplay scene.
+Each display frame has a 561,792-cycle budget. Fast and Detailed can exceed
+that budget more often. The on-screen FPS counter remains measured.
+
+The sky has eight gradient bands, goal crossbars use team colours, and white
+score text retains coloured team underlines for readability. These changes add
+no geometry. High-precision projection uses 4 KB of EWRAM to reduce division
+cost without the old visible depth steps.
+
+`python3 tests/test_simulation_timing.py` checks the real ROM in mGBA: four simulation
+ticks per eight hardware refreshes, a held jump cannot accidentally consume the double
 jump, a second press can, and the match countdown advances at real-time speed.
+
+## Match feedback and boost polish
+
+Distant visible balls have small tracking brackets; off-screen balls retain the
+directional arrow. The clock turns gold below 30 seconds and red below 10.
+Speed mode shows the current camera mode (or replay status) on its transparent HUD.
+
+Boost thrust is proportional to the fuel actually spent, including the last
+partial charge. Aerial boost uses a single vector-speed limit, so diagonal
+boosting cannot exceed the straight-line limit. Turning and boosting measured
+29.86 FPS in the short scripted mGBA scenarios for this update.
+
+When the car lands on its side or roof, holding **R** (or **Select** with
+Alternative controls) assists the gradual landing recovery. This uses the same
+damped rotation as normal recovery, without snapping upright or changing the
+car's attitude in the air. Speed mode displays a contextual recovery hint and
+an aerial-control hint above the camera label.
+
+The chase camera starts following as the car turns, with bounded angular
+acceleration and gentle braking as it approaches the car heading. It settles
+without overshooting; kickoff resets its turn velocity. Ball-camera tracking
+is unchanged.
+
+Left/right yaw steering runs at half the previous build's speed (18.75% of
+the original rate), including drift and aerial yaw.
+The chase camera smoothly follows the car.
+
+Steering builds up more gently. Fractional yaw is drawn on the car and camera
+together, avoiding visible whole-angle steps at low turning speeds. Releasing
+steering preserves that fractional pose without snapping back.
+
+Physics and presentation now use the latest state on each 30 Hz frame, removing
+one frame of display latency. Normal play advances one fixed simulation tick
+per two hardware refreshes (29.86 updates per second on GBA); late frames can
+run catch-up ticks. The ROM timing test checks movement and simulation progress
+on every sampled frame, as well as jump input and the real-time match clock.
+
+Camera easing is brief: stronger acceleration and a higher catch-up speed
+keep it close to steering, while retaining a soft start and stop.
+
+Chase-camera response now applies 87.5% of the desired angular-speed change
+immediately, leaving only a small eased remainder. Car steering is unchanged.
+
+## Quick match and training controls
+
+- In a solo match, press Start and choose **Restart Match** to reset the score,
+  clock and kickoff while keeping the selected game mode and settings.
+- During training, hold **Select + A** to retry the current shot immediately.
+- Hold **Select + B** to advance to the next drill (wrapping after the last).
+- Start still returns to the training selection screen. The shortcuts appear
+  on the training HUD; Select does not cover them with the map.
+
+The soccer ball now has 64 baked rolling frames (previously 16). Fractional
+spin accumulation keeps slow rolls moving and treats both rolling directions
+equally. The additional 192 KiB lives in ROM; rendering uses the same sprite
+loop, with no extra triangles or runtime lighting. Presentation remains 30 Hz.
+
+Speed cars now use six-sided wheel silhouettes (48 faces, up from 40).
+Selective textures include headlights, grilles, tail lamps, hubs and tyre
+ tread as well as paint stripes and glass. Opponents retain flat shading in
+Speed mode. Car poses remain rendered at the 30 Hz cadence, with fractional
+yaw; these are real-time meshes rather than baked sprite animation frames.
+Turn and boost benchmarks averaged 29.86 FPS after this update.
+
+Car-to-car impacts now use equal-mass impulses with 0.35 restitution,
+preserving tangential velocity and removing the first-car ram bonus. Exact
+contact distances and a fallback normal let coincident cars separate reliably.
+
+Car–ball contact now uses symmetric fixed-point normals and impulses, so
+mirrored hits have matching strength. Penetration correction keeps the ball
+inside the floor and ceiling instead of briefly pushing it through them.

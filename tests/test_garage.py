@@ -8,7 +8,7 @@ with tempfile.TemporaryDirectory() as tmp:
         s=(Path(os.environ['STADIUM_SOURCE']) if name=='stadium.c' and 'STADIUM_SOURCE' in os.environ else root/name).read_text()
         if name=='engine3d.c':
             s='int test_disable_flat_fastpath;\nlong test_vertices,test_faces,test_projections;\n'+s
-            s=s.replace('if(render_mode==RENDER_FLAT && model_vertices', 'if(!test_disable_flat_fastpath && render_mode==RENDER_FLAT && model_vertices')
+            s=s.replace('if(face_mode==RENDER_FLAT && model_vertices', 'if(!test_disable_flat_fastpath && face_mode==RENDER_FLAT && model_vertices')
             s=s.replace('int project_vertex_world(Vector3 world_pos, int *sx, int *sy) {','int project_vertex_world(Vector3 world_pos, int *sx, int *sy) { ++test_projections;')
             s=s.replace('    /* Reject unsupported meshes before transforming', '    if(mesh){test_vertices+=mesh->vertex_count;test_faces+=mesh->face_count;}\n    /* Reject unsupported meshes before transforming')
         if name=='engine3d.c' and os.environ.get('STADIUM_PROFILE'):
@@ -89,7 +89,7 @@ static int current_tutorial_stage,screen_shake;
 static struct {int objective;} tutorial_stages[1];
 static void spawn_explosion(Vector3 p,u8 c){}
 static void spawn_goal_celebration(Vector3 p,u8 c){}
-static int measured_fps=30;
+static int measured_fps=30,control_scheme;
 static int score_blue=2,score_orange=1,match_timer=3600,cam_mode,scoring_team=3,state_timer=100;
 static struct {int boosted,goal_scored;} tutorial_progress;
 '''+pitch_constants+'\n'+pitch+radar+boost_code+physics+ball_physics+collisions+hud_text+match_hud+'''
@@ -122,7 +122,7 @@ int main(void) {
     performance_mode=0;
     {
         Car c={0};apply_air_rotation(&c,1,-1);
-        assert(c.visual_pitch==9 && c.visual_roll==238);
+        assert(c.visual_pitch==3 && c.visual_roll==252);
         apply_air_rotation(&c,-1,1);assert(!c.visual_pitch && !c.visual_roll);
         draw_achievements(2);save_preview("achievements.ppm");
         assert(frame_buffer[27*240+83]==131);
@@ -172,7 +172,7 @@ int main(void) {
         assert(check_car_ball_collision(&c));assert(ball.vel.x==3*256); /* tangent */
         c=(Car){0};c.pos.y=BALL_RADIUS+20*256;c.vel.y=-4*256;
         ball.pos=(Vector3){0,BALL_RADIUS,0};ball.vel=(Vector3){0,0,0};
-        assert(check_car_ball_collision(&c));assert(ball.vel.y<0); /* downward hit */
+        assert(check_car_ball_collision(&c));assert(ball.vel.y<0 && ball.pos.y==BALL_RADIUS); /* downward hit stays above floor */
         c=(Car){0};c.pos.y=BALL_RADIUS;c.vel=(Vector3){40*256,40*256,40*256};
         ball.pos=(Vector3){14*256,BALL_RADIUS+14*256,14*256};ball.vel=(Vector3){0,0,0};
         assert(check_car_ball_collision(&c));
@@ -180,6 +180,17 @@ int main(void) {
         assert(x*x+y*y+z*z<=(22*16+1)*(22*16+1));
         ball.pos=(Vector3){0,BALL_RADIUS,0};ball.vel=(Vector3){0,-64,0};
         update_ball_physics();assert(ball.pos.y==BALL_RADIUS && ball.vel.y==0);
+    }
+    /* Mirrored contacts must impart identical speed in opposite directions. */
+    {
+        int result[2];
+        for(int side=0;side<2;side++) {
+            int sign=side?1:-1;Car c={0};c.pos.y=BALL_RADIUS;c.vel.x=sign*4*256;
+            ball.pos=(Vector3){sign*26*256,BALL_RADIUS,0};ball.vel=(Vector3){0,0,0};
+            assert(check_car_ball_collision(&c));result[side]=ball.vel.x;
+            assert(ball.pos.y>=BALL_RADIUS);
+        }
+        assert(result[0]==-result[1]);
     }
     /* Bulk horizontal strokes must preserve inclusive endpoints and clipping. */
     for(int direction=0;direction<2;direction++) for(int y=0;y<160;y+=17) {
@@ -191,13 +202,97 @@ int main(void) {
         draw_line(direction?117:11,y,direction?11:117,y,130);
         for(int x=0;x<240;x++)assert(frame_buffer[y*240+x]==(x>=11 && x<=117?130:0));
     }
+    /* Steering softens at speed, builds progressively and stops on release. */
+    {
+        Car slow={0},fast={0};slow.is_on_ground=fast.is_on_ground=1;
+        fast.speed=12*256;
+        steer_car(&slow,1,0,0);assert(slow.yaw==0);
+        assert(slow.steer_velocity==36 && slow.steer_fraction==36);
+        for(int i=0;i<19;i++)steer_car(&slow,1,0,0);
+        for(int i=0;i<20;i++)steer_car(&fast,1,0,0);
+        assert(slow.yaw>fast.yaw && fast.yaw>0);
+        assert(slow.yaw<=11 && fast.yaw<=5);
+        int yaw=slow.yaw,fraction=slow.steer_fraction;steer_car(&slow,0,0,0);
+        assert(slow.yaw==yaw && !slow.steer_velocity && slow.steer_fraction==fraction);
+        steer_car(&slow,-1,0,1);assert(slow.yaw==yaw);
+        Car grip={0};grip.is_on_ground=1;grip.vel=(Vector3){8*256,0,12*256};
+        grip_car(&grip,0,0);assert(grip.vel.x==5*256 && grip.vel.z==12*256);
+        grip_car(&grip,0,1);assert(grip.vel.z<12*256);
+        Car drift={0};drift.is_on_ground=1;drift.vel=(Vector3){8*256,0,12*256};
+        grip_car(&drift,1,0);assert(drift.vel.x==8*256 && drift.vel.z==12*256);
+        drift.is_on_ground=0;grip_car(&drift,0,1);
+        assert(drift.vel.x==8*256 && drift.vel.z==12*256);
+    }
+    /* Fractional steering moves both the mesh and camera without whole-angle jumps. */
+    {
+        Car c={0};int32_t before[9],after[9];build_car_rotation(&c,before);
+        c.steer_fraction=128;build_car_rotation(&c,after);
+        assert(after[2]>before[2]);
+        chase_turn_velocity=0;assert(follow_chase_heading(0,&c)>0);
+        steer_car(&c,0,0,0);assert(c.steer_fraction==128);
+    }
+    /* Fuel controls thrust strength; diagonal velocity shares one cap. */
+    {
+        player=(Car){0};player.boost=310;player.boost_requested=1;
+        apply_player_boost();int full=player.vel.z;
+        player=(Car){0};player.boost=31;player.boost_requested=1;
+        apply_player_boost();assert(player.vel.z>0 && player.vel.z<full/8 && !player.boost);
+        Vector3 velocity={19*256,19*256,19*256};int cap=198*256/10;
+        limit_boost_velocity(&velocity,cap);
+        assert(velocity.x==velocity.y && velocity.y==velocity.z);
+        assert(velocity.x*velocity.x+velocity.y*velocity.y+velocity.z*velocity.z<=cap*cap);
+        velocity=(Vector3){0,0,10*256};limit_boost_velocity(&velocity,cap);
+        assert(velocity.z==10*256);
+    }
+    /* Recovery is explicit, gradual, and disabled in the air. */
+    {
+        Car c={0};c.is_on_ground=1;c.visual_roll=128;c.settle_delay=4;
+        assist_ground_recovery(&c,0);assert(c.visual_roll==128 && c.settle_delay==4);
+        assist_ground_recovery(&c,1);assert(c.visual_roll!=0 && !c.settle_delay);
+        for(int i=0;i<80;i++)assist_ground_recovery(&c,1);
+        assert(!car_needs_recovery(&c));
+        c.is_on_ground=0;c.visual_roll=128;
+        assist_ground_recovery(&c,1);assert(c.visual_roll==128);
+    }
+    /* 50% game time: 120 displayed frames advance 120 simulation ticks,
+       with identical displayed travel on regular and delayed frames. */
+    {
+        unsigned phase=0;int steps_total=0;
+        Vector3 previous={0,0,0},current={0,0,0},last={-256,0,0};
+        for(int frame=0;frame<120;frame++) {
+            int steps=scaled_simulation_steps(2,&phase);steps_total+=steps;
+            for(int i=0;i<steps;i++){previous=current;current.x+=256;}
+            Vector3 shown=blend_position(previous,current,phase*64);
+            assert(shown.x-last.x==256);last=shown;
+        }
+        assert(steps_total==120 && !phase);
+        assert(blend_heading(255*256,256,128)==0);
+        phase=0;steps_total=0;
+        for(int i=0;i<240;i++)steps_total+=scaled_simulation_steps(1,&phase);
+        assert(steps_total==120 && !phase);
+    }
+    /* Blended rotation stays rigid, including diagonal flips and yaw wrap. */
+    for(int yaw=0;yaw<256;yaw+=32)for(int fraction=64;fraction<256;fraction+=64) {
+        Car before={0},after={0};before.yaw=yaw;after.yaw=(yaw+32)&255;
+        after.flip_timer=FLIP_DURATION_TICKS-3*FLIP_STEP_TICKS;
+        after.flip_pitch_dir=1;after.flip_roll_dir=-1;
+        int32_t matrix[9];blend_car_rotation(&before,&after,fraction,matrix);
+        for(int col=0;col<3;col++) {
+            int length=0;for(int row=0;row<3;row++)length+=matrix[row*3+col]*matrix[row*3+col];
+            assert(abs(length-4096*4096)<70000);
+            for(int other=col+1;other<3;other++) {
+                int dot=0;for(int row=0;row<3;row++)dot+=matrix[row*3+col]*matrix[row*3+other];
+                assert(abs(dot)<20000);
+            }
+        }
+    }
     /* Camera interpolation takes the short path, without overshoot or stalls. */
     for(int start=0;start<256;start+=8)for(int target=0;target<256;target+=8) {
         int heading=start*256;
         for(int step=0;step<192;step++) {
             int next=smooth_camera_heading(heading,target);
             int delta=(next-heading)&65535;if(delta>32768)delta-=65536;
-            assert(abs(delta)<=4*256);
+            assert(abs(delta)<=3*256);
             int old=(target*256-heading)&65535;if(old>32768)old-=65536;
             int remaining=(target*256-next)&65535;if(remaining>32768)remaining-=65536;
             assert(abs(remaining)<=abs(old));heading=next;
@@ -205,6 +300,24 @@ int main(void) {
         assert(heading==target*256);
     }
     assert(smooth_camera_heading(0,1)>0 && smooth_camera_heading(0,1)<256);
+    /* Chase follows immediately with only a small eased remainder. */
+    {
+        Car c={0};c.yaw=1;chase_turn_velocity=0;
+        int heading=follow_chase_heading(0,&c);
+        assert(heading>=224 && heading<256);
+        for(int i=0;i<8;i++)heading=follow_chase_heading(heading,&c);
+        assert(heading==256 && !chase_turn_velocity);
+        c.yaw=16;heading=0;chase_turn_velocity=0;
+        for(int i=0;i<16;i++) {
+            heading=follow_chase_heading(heading,&c);
+            assert(heading<=16*256);
+        }
+        assert(heading==16*256);
+        c.yaw=1;heading=255*256;chase_turn_velocity=0;
+        for(int i=0;i<8;i++)heading=follow_chase_heading(heading,&c);
+        assert(heading==256 && !chase_turn_velocity);
+    }
+
     for(int angle=0;angle<256;angle++) {
         assert(camera_sin_q8(angle*256)==custom_sin_lut[angle]);
         int a=camera_sin_q8(angle*256), b=camera_sin_q8((angle+1)*256);
@@ -373,6 +486,22 @@ int main(void) {
         check_car_car_collision(&low,&high);
         assert(low.pos.y<0 && high.pos.y>10*256);
     }
+    /* Car impacts conserve momentum, ignore argument order, and cannot add energy. */
+    {
+        Car a={0},b={0};a.pos.x=-10*256;b.pos.x=10*256;
+        a.vel=(Vector3){6*256,0,2*256};b.vel=(Vector3){-2*256,0,2*256};
+        Car reversed_a=a,reversed_b=b;
+        check_car_car_collision(&a,&b);
+        check_car_car_collision(&reversed_b,&reversed_a);
+        assert(a.vel.x+b.vel.x==4*256);
+        assert(a.vel.z==2*256 && b.vel.z==2*256);
+        assert(a.vel.x==reversed_a.vel.x && b.vel.x==reversed_b.vel.x);
+        assert(a.vel.x*a.vel.x+b.vel.x*b.vel.x<=40*256*256);
+        int av=a.vel.x,bv=b.vel.x;check_car_car_collision(&a,&b);
+        assert(a.vel.x==av && b.vel.x==bv); /* separating contacts don't bounce again */
+        a=(Car){0};b=(Car){0};check_car_car_collision(&a,&b);
+        assert(a.pos.x<0 && b.pos.x>0);
+    }
     /* Goal mouths stay flat and traversable; above the opening is a wall. */
     for(int sign=-1;sign<=1;sign+=2) {
         Vector3 p={0,0,sign*(STADIUM_LENGTH+10*256)},normal;
@@ -395,8 +524,8 @@ int main(void) {
         const Mesh *levels[4]={car_models[model],car_gameplay_mesh(model,100*100),car_gameplay_mesh(model,300*300),car_speed_models[model]};
         for(int level=1;level<4;level++) {
             const Mesh *mesh=levels[level];
-            assert(mesh->vertex_count<levels[level-1]->vertex_count);
-            assert(mesh->face_count<levels[level-1]->face_count);
+            assert(mesh->vertex_count<=levels[level-1]->vertex_count);
+            assert(mesh->face_count<=levels[level-1]->face_count);
             for(int f=0;f<mesh->face_count;f++) {
                 Face face=mesh->faces[f];
                 assert(face.v1<mesh->vertex_count && face.v2<mesh->vertex_count && face.v3<mesh->vertex_count);
@@ -663,7 +792,7 @@ int main(void) {
         draw_soccer_pitch(camera);
         draw_stadium_curves(camera,STADIUM_WIDTH,STADIUM_LENGTH,GOAL_HALF_WIDTH);
         draw_stadium_goal(STADIUM_LENGTH,GOAL_HALF_WIDTH,GOAL_HEIGHT,131);
-        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,mode?RENDER_FLAT:RENDER_TEXTURED);
+        draw_model_world(car_gameplay_mesh(0,100*100),(Vector3){-16*256,0,0},32,0,0,256,3,mode?RENDER_ACCENTS:RENDER_TEXTURED);
         draw_soccer_ball((Vector3){25*256,14*256,0},0,0);
         player.boost=74*256;draw_match_hud();
         save_preview(mode==2?"speed-mode.ppm":mode?"fast-mode.ppm":"detailed-mode.ppm");

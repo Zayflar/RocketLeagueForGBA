@@ -24,9 +24,9 @@ int main(void) {
         custom_sin_fp[i]=lround(sin(i*6.283185307179586/256)*256);
         custom_cos_fp[i]=lround(cos(i*6.283185307179586/256)*256);
     }
-    assert(FLIP_STEP_TICKS * 10 * 5 == FLIP_DURATION_TICKS * 6);
+    assert(FLIP_STEP_TICKS==3);
     int frames=(FLIP_DURATION_TICKS+FLIP_STEP_TICKS-1)/FLIP_STEP_TICKS;
-    assert(frames==9);
+    assert(frames==17);
     for(int wall=-2;wall<=2;wall++) for(int yaw=0;yaw<256;yaw+=16) {
         double straight=0;
         for(int pitch=-1;pitch<=1;pitch++) for(int roll=-1;roll<=1;roll++) {
@@ -58,7 +58,7 @@ int main(void) {
     for(int i=0;i<frames;i++)step(&tilted);
     assert(tilted.visual_pitch==40 && tilted.visual_roll==96);
     step(&tilted);assert(tilted.visual_pitch==40 && tilted.visual_roll==96);
-    puts("PASS: faster full dodge rotation, neutral recovery, balanced directional impulse on floor and walls");
+    puts("PASS: slower full dodge rotation, neutral recovery, balanced directional impulse on floor and walls");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

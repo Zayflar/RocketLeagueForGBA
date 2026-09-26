@@ -34,6 +34,9 @@ int active_pitch_mode = 0; /* 0=soccer, 1=hockey */
 
 /* Code-native 64x64 atlas: eight 16x32 panels. Zero keeps the lit
  * team paint, so one texture works for both blue and orange cars. */
+/* High precision reciprocal samples, interpolated in fractional depth. */
+static u32 projection_reciprocal[1025] __attribute__((section(".ewram"),aligned(4)));
+
 static void init_car_texture(void) {
     for (int v = 0; v < 64; ++v) for (int u = 0; u < 64; ++u) {
         int tile = (v / 32) * 4 + u / 16;
@@ -42,7 +45,8 @@ static void init_car_texture(void) {
         switch (tile) {
         case 0: /* Hood/deck: twin ivory racing stripes and inset vents. */
             if (x == 5 || x == 6 || x == 9 || x == 10) c = 14;
-            if ((x == 2 || x == 13) && y > 5 && y < 15) c = 4;
+            if ((x == 2 || x == 13) && y > 5 && y < 15) c = (y&1)?4:8;
+            if (y==23 && x>1 && x<14 && c==0)c=10;
             break;
         case 1: /* Side: swept decal above the dark rocker panel. */
             if (y > 24) c = 4;
@@ -62,7 +66,7 @@ static void init_car_texture(void) {
         case 4: /* Glass with a broad reflection and painted surround. */
             if (x > 1 && x < 14 && y > 3 && y < 28) {
                 int reflection = 10 + x / 2;
-                c = y < reflection - 2 ? 57 : (y <= reflection ? 86 : 51);
+                c = y < reflection - 3 ? 145 : (y <= reflection ? 140 : 144);
                 if (x == 2 || y == 27) c = 7;
             }
             break;
@@ -75,7 +79,7 @@ static void init_car_texture(void) {
             if (r < 10) c = 14;
             break;
         }
-        case 6: c = ((y & 7) == 0 && (x & 3) < 2) ? 6 : 4; break; /* Underbody and tyre tread. */
+        case 6: c = (((x+(y>>1)) & 7) < 2) ? 8 : 4; break; /* Underbody and tyre tread. */
         default: break; /* Plain team paint. */
         }
         car_texture[v][u] = c;
@@ -262,6 +266,10 @@ void init_3d_engine(void) {
         pal_bg_mem[192+i]=RGB5(shade,shade,shade<30?shade+1:31);
     }
 
+    pal_bg_mem[232]=RGB5(4,24,6); /* subtle grass grain beside index 135 */
+
+    for(int i=1;i<=1024;i++)projection_reciprocal[i]=16777216u/i;
+
     // Pre-calculate Division LUT (1 / i) in 16.16 fixed point
     custom_div_lut[0] = 0;
     for (int i = 1; i < 2048; i++) {
@@ -336,12 +344,15 @@ static inline int project_quotient(int numerator, int depth, int reciprocal) {
     return value;
 }
 static IWRAM_CODE __attribute__((noinline)) void project_camera_point(fixed x, fixed y, fixed z, int *sx, int *sy) {
-    if(performance_mode==2 && z>=8*FP_SCALE && z<2048*FP_SCALE) {
-        int reciprocal=custom_div_lut[z>>8];
-        *sx=(int)(((int64_t)x*120*reciprocal)>>24)+120;
-        *sy=(int)(((int64_t)-y*120*reciprocal)>>24)+80;
+    if(performance_mode==2 && z>=32*FP_SCALE && z<1024*FP_SCALE) {
+        int whole=z>>8,fraction=z&255;
+        int a=projection_reciprocal[whole],b=projection_reciprocal[whole+1];
+        int reciprocal=a+(b-a)*fraction/256;
+        *sx=(int)(((int64_t)x*120*reciprocal)/4294967296LL)+120;
+        *sy=(int)(((int64_t)-y*120*reciprocal)/4294967296LL)+80;
         return;
     }
+    /* Preserve fractional depth: integer-depth lookup caused visible jitter. */
     int reciprocal=1073741824/z;
     *sx=project_quotient(x*120,z,reciprocal)+120/RENDER_SCALE;
     *sy=project_quotient(-y*120,z,reciprocal)+80/RENDER_SCALE;
@@ -364,9 +375,22 @@ IWRAM_CODE void draw_environment_background(u8 sky_color) {
     if (start_y > 160) start_y = 160;
 
     if(performance_mode==2) {
-        /* Flat field and horizon bands leave cycles for 60 Hz car motion. */
-        memset32(frame_buffer,(sky_color==14?14u:169u)*0x01010101u,start_y*60);
-        memset32(frame_buffer+start_y*240,(sky_color==14?14u:135u)*0x01010101u,(160-start_y)*60);
+        /* Eight smooth sky bands and a low-contrast grass weave use bulk word
+           fills, avoiding a per-pixel texture sampler in the Speed preset. */
+        if(sky_color==14) {
+            memset32(frame_buffer,14u*0x01010101u,start_y*60);
+            memset32(frame_buffer+start_y*240,14u*0x01010101u,(160-start_y)*60);
+        } else {
+            for(int band=0;band<8;band++) {
+                int top=start_y*band/8,bottom=start_y*(band+1)/8;
+                u32 color=SKY_GRADIENT_START+2+band*13/7;
+                memset32(frame_buffer+top*240,color*0x01010101u,(bottom-top)*60);
+            }
+            for(int y=start_y;y<160;y++) {
+                u32 grass=(y&2)?0x8787e887u:0xe8878787u;
+                memset32(frame_buffer+y*240,grass,60);
+            }
+        }
         return;
     }
 
@@ -957,7 +981,7 @@ IWRAM_CODE int draw_soccer_ball(Vector3 pos, int yaw, int pitch) {
     if(x1>RENDER_WIDTH) x1=RENDER_WIDTH;
     if(y1>RENDER_HEIGHT) y1=RENDER_HEIGHT;
     if(x0>=x1 || y0>=y1) return 1;
-    const u8 *tex=ball_sprite[((yaw+pitch)&255)>>4];
+    const u8 *tex=ball_sprite[((yaw+pitch)&255)>>2];
     int step=(64<<16)/diameter;
     int v=(y0-top)*step+step/2;
     for(int py=y0;py<y1;py++,v+=step) {
@@ -1205,9 +1229,14 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
             ? (u8)color_override : f.base_color;
         u8 color = material_shade(base_col, intensity);
 
+        int face_mode=render_mode;
+        if(render_mode==RENDER_ACCENTS) {
+            int tile=(f.uv[0][1]/32)*4+f.uv[0][0]/16;
+            face_mode=tz>48*FP_SCALE && (tile==0 || tile==2 || tile==3 || tile==4 || tile==5 || tile==6)?RENDER_TEXTURED:RENDER_FLAT;
+        }
         /* The sorting pass already culled fully projected faces. Flat cars
            need neither UV copying nor the general near-plane clipper here. */
-        if(render_mode==RENDER_FLAT && model_vertices[f.v1].z>NEAR_PLANE &&
+        if(face_mode==RENDER_FLAT && model_vertices[f.v1].z>NEAR_PLANE &&
            model_vertices[f.v2].z>NEAR_PLANE && model_vertices[f.v3].z>NEAR_PLANE) {
             int x0=screen_x[f.v1],y0=screen_y[f.v1];
             int x1=screen_x[f.v2],y1=screen_y[f.v2];
@@ -1260,10 +1289,10 @@ IWRAM_CODE int draw_model_world_mat(const Mesh *mesh, Vector3 pos, const int32_t
                             y0 >= 0 && y1 >= 0 && y2 >= 0 &&
                             y0 < RENDER_HEIGHT && y1 < RENDER_HEIGHT && y2 < RENDER_HEIGHT);
 
-            if (render_mode == RENDER_FLAT) {
+            if (face_mode == RENDER_FLAT) {
                 if (is_fully) draw_triangle_flat_unclipped(x0,y0,x1,y1,x2,y2,color);
                 else          draw_triangle_flat_clipped(x0,y0,x1,y1,x2,y2,color);
-            } else if (render_mode == RENDER_TEXTURED) {
+            } else if (face_mode == RENDER_TEXTURED) {
                 int u0 = clipped[ti].v[0].u; int v0 = clipped[ti].v[0].v;
                 int u1 = clipped[ti].v[1].u; int v1 = clipped[ti].v[1].v;
                 int u2 = clipped[ti].v[2].u; int v2 = clipped[ti].v[2].v;

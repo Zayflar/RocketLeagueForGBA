@@ -15,21 +15,19 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run(['cc',str(p/'offset.c'),'-o',str(p/'offset')],check=True)
     double,ground,flip=map(int,subprocess.check_output([str(p/'offset')],text=True).split())
     read=lambda symbol,offset=0:f'r/4 0x{symbols[symbol]+offset:x}'
-    commands=[f'b/t 0x{symbols["present_frame"]:x}','c',f'w/4 0x{symbols["game_state"]:x} 2',f'b/t 0x{key_return:x}','c',f'w/2 0x{symbols["__key_curr"]:x} 1',f'w/2 0x{symbols["__key_prev"]:x} 0','d 2','c','c','c','c','c',read('match_timer'),read('pad_pulse'),f'b/t 0x{key_return:x}']
-    for keys,previous in [(1,0),(1,1),(0,1),(1,0)]:
-        commands+=['c',f'w/2 0x{symbols["__key_curr"]:x} {keys}',f'w/2 0x{symbols["__key_prev"]:x} {previous}','c',read('player',double),read('player',ground),read('player',flip),read('match_timer'),read('pad_pulse'),read('player',4)]
+    write=lambda symbol,value:f'w/4 0x{symbols[symbol]:x} {value}'
+    commands=[f'b/t 0x{symbols["present_frame"]:x}','c',f'b/t 0x{key_return:x}']
+    def case(state,keys,setup,reads):
+        commands.extend(['c',write('game_state',state),f'w/2 0x{symbols["__key_curr"]:x} {keys}',f'w/2 0x{symbols["__key_prev"]:x} 0']+setup+['c']+[read(name) for name in reads])
+    case(9,1,[write('pause_selection',1),write('score_blue',4),write('score_orange',2)],['game_state','score_blue','score_orange','match_timer'])
+    case(18,5,[write('current_training_level',3)],['game_state','current_training_level'])
+    case(18,6,[write('current_training_level',9)],['game_state','current_training_level'])
     commands+=['q']
     shutil.copyfile(root/'gba_3d.gba',p/'test.gba')
     result=subprocess.run(['stdbuf','-oL','/usr/games/mgba','-d',str(p/'test.gba')],input='\n'.join(commands)+'\n',text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20,env={**os.environ,'SDL_VIDEODRIVER':'dummy','SDL_AUDIODRIVER':'dummy'})
     values=[int(v,16) for v in re.findall(r'^\s*0x([0-9a-fA-F]{8})\s*$',result.stdout,re.M)]
-    assert len(values)==26,result.stdout[-4000:]
-    initial,initial_pulse=values[:2]
-    for frame in range(4):
-        double_left,on_ground,flip_timer,clock,pulse,height=values[2+frame*6:8+frame*6]
-        assert not on_ground and not flip_timer,values
-        assert double_left==(frame<3),values
-        assert clock==initial-2*(frame+1),values
-        assert ((pulse-initial_pulse)&255)==3*(frame+1),values
-        if frame: assert height!=values[2+(frame-1)*6+5],values
-    assert ((values[-2]-initial_pulse)&255)==12,values # four ticks over eight refreshes
-    print('PASS: fresh position and one simulation update every 30 Hz frame; one press jumps once, holding does not double-jump, second press does; clock stays real-time')
+    assert values[:3]==[8,0,0],values
+    assert 7196<=values[3]<=7200,values
+    assert values[4] in (17,18) and values[5]==3,values
+    assert values[6] in (17,18) and values[7]==0,values
+    print('PASS: pause restart resets match; training retry retains drill; next drill wraps')

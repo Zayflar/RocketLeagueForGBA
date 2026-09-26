@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess, tempfile
 s=(Path(__file__).resolve().parents[1]/'main.c').read_text()
 states=s[s.index('typedef enum {'):s.index('} GameState;')+len('} GameState;')]
-defs=s[s.index('typedef enum {',s.index('/* --- Tutorial')):s.index('/* Five ticks')]
+defs=s[s.index('typedef enum {',s.index('/* --- Tutorial')):s.index('#define NUM_TRAINING_LEVELS')]
 car=s[s.index('typedef struct {\n    Vector3 pos;\n    Vector3 vel;'):s.index('} Car;')+len('} Car;')]
 setup=s[s.index('static void setup_tutorial_stage'):s.index('static const char *tutorial_control_hint')]
 advance=s[s.index('static void complete_tutorial_stage'):s.index('static void apply_player_boost')]
@@ -28,7 +28,8 @@ static void spawn_explosion(Vector3 p,u8 color) {}
 static Car player;
 static struct {Vector3 pos,vel;} ball;
 static char particles[100];
-static int camera_yaw,cam_mode;
+static int camera_yaw,cam_mode,chase_turn_velocity;
+static void reset_steering(Car *c){c->steer_velocity=c->steer_fraction=0;}
 static GameState game_state;
 '''+setup+advance+'\nstatic void check_lesson(void) {\n'+checks+'\n}\n'+'''
 int main(void) {

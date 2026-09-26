@@ -144,7 +144,7 @@ void draw_stadium_goal(fixed z, fixed w, fixed h, u8 color) {
     Vector3 front[4]={{-w,0,z},{w,0,z},{w,h,z},{-w,h,z}};
     Vector3 rear[4]={{-w,0,back},{w,0,back},{w,h,back},{-w,h,back}};
     if(performance_mode==2) {
-        for(int i=1;i<4;i++)draw_world_line(front[i],front[(i+1)&3],130);
+        for(int i=1;i<4;i++)draw_world_line(front[i],front[(i+1)&3],i==2?color:130);
         draw_world_line(front[0],front[1],color);
         draw_world_line(rear[2],rear[3],color);
         draw_world_line(front[2],rear[2],color);

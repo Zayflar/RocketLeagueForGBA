@@ -13,6 +13,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef int32_t fixed;
 #define FP_SCALE 256
 static int performance_mode;
 static int custom_div_lut[2049];
+static u32 projection_reciprocal[1025];
 #define IWRAM_CODE
 static int fills;
 static void fast_span_fill(u8 *dst,u32 color,int count) {++fills;memset(dst,color&255,count);}
@@ -42,6 +43,7 @@ int main(void) {
         }
     }
     for(int i=1;i<=2048;i++)custom_div_lut[i]=65536/i;
+    for(int i=1;i<=1024;i++)projection_reciprocal[i]=16777216u/i;
     unsigned seed=1;
     for(int i=0;i<200000;i++) {
         seed=seed*1664525u+1013904223u;int x=(int)(seed%1000001)-500000;
@@ -49,6 +51,13 @@ int main(void) {
         seed=seed*1664525u+1013904223u;int z=2048+seed%500000;
         int sx,sy;project_camera_point(x,y,z,&sx,&sy);
         assert(sx==x*120/z+120 && sy==-y*120/z+80);
+    }
+    performance_mode=2;
+    for(int z=32*256;z<1024*256;z+=13) {
+        int x=z/2,y=-z/3,sx,sy;
+        project_camera_point(x,y,z,&sx,&sy);
+        assert(abs(sx-(x*120/z+120))<=1);
+        assert(abs(sy-(-y*120/z+80))<=1);
     }
     fills=0;draw_grass_span(buffer,240,-60000,128,colors);
     assert(fills<=4);

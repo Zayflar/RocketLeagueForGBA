@@ -27,15 +27,15 @@ def build(kind, detail=0):
     front,rear=(6,-11) if kind==0 else ((3,-12) if kind==1 else (10,-12))
     solid([(-width+1,height,front),(width-1,height,front),(width-1,height,rear),(-width+1,height,rear),
            (-7,roof,front-5),(7,roof,front-5),(7,roof,rear+2),(-7,roof,rear+2)], [6,4,4,4,4,0])
-    # Garage: eight-sided wheels; match and Fast: six; Speed: four.
-    segments = (8, 6, 6, 4)[detail]
+    # Garage: eight-sided wheels; gameplay: six-sided wheel silhouettes.
+    segments = (8, 6, 6, 6)[detail]
     for side in (-1,1):
         for z in (-11,11):
             if detail>=2:
                 # One outward sidewall; simplified wheels avoid hidden inner faces.
                 off=len(vertices);x=side*15
                 for i in range(segments):
-                    t=(i+(.5 if detail==3 else 0))*2*math.pi/segments
+                    t=i*2*math.pi/segments
                     vertices.append((x,5+round(5*math.cos(t)),z+round(5*math.sin(t))))
                 for i in range(1,segments-1):
                     ids=[off,off+i,off+i+1]

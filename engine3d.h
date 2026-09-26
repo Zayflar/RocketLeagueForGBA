@@ -67,6 +67,7 @@ typedef struct {
 #define RENDER_OUTLINED    3
 #define RENDER_OUTLINED_WHITE 4
 #define RENDER_TEXTURED    5
+#define RENDER_ACCENTS     6 /* textured paint/glass panels; flat tyres and sides */
 
 /* --- Shared EWRAM Frame Buffer --- */
 extern u8 frame_buffer[240 * 160];

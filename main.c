@@ -153,15 +153,15 @@ static int training_timer = 0;
 static int training_touches = 0; // track number of ball touches
 static int training_post_touch_timer = 0;
 
-/* Five ticks per old frame; six per update makes angular speed 20% faster.
- * Retain the fractional final step instead of rounding down to eight poses. */
+/* Slower flips expose more intermediate poses while preserving total impulse. */
 #define FLIP_DURATION_TICKS 50
-#define FLIP_STEP_TICKS 6
+#define FLIP_STEP_TICKS 3
 
 /* --- Physics Structures --- */
 typedef struct {
     Vector3 pos;
     Vector3 vel;
+    int steer_velocity,steer_fraction; /* fractional, speed-sensitive steering */
     int yaw;            // 0-255 rotation angle
     fixed speed;        // Forward/backward driving speed
     fixed boost;        // Boost meter (0 to 100 * FP_SCALE)
@@ -195,6 +195,16 @@ static void build_car_rotation(const Car *car, int32_t rotation[9]) {
     } else {
         build_model_rotation(car->yaw, car->visual_pitch, car->visual_roll, rotation);
     }
+    /* Draw sub-step yaw instead of waiting for a whole 1/256 turn. */
+    if(car->steer_fraction) {
+        int sine=camera_sin_q8(car->steer_fraction);
+        int cosine=camera_cos_q8(car->steer_fraction);
+        for(int col=0;col<3;col++) {
+            int x=rotation[col],z=rotation[6+col];
+            rotation[col]=(x*cosine+z*sine)/4096;
+            rotation[6+col]=(z*cosine-x*sine)/4096;
+        }
+    }
     if(!car->surface_wall || !car->surface_angle) return;
     for(int col=0;col<3;col++) {
         Vector3 v={rotation[col],rotation[3+col],rotation[6+col]};
@@ -204,6 +214,44 @@ static void build_car_rotation(const Car *car, int32_t rotation[9]) {
 }
 
 /* Angle lookup only runs on touchdown, not every rendered frame. */
+/* Rendering interpolates between fixed physics states, never feeding blended
+   positions back into collision or linked-game simulation. */
+static int scaled_simulation_steps(int elapsed,unsigned *phase) {
+    *phase+=elapsed*2;
+    int steps=*phase/4;
+    *phase%=4;
+    return steps;
+}
+static Vector3 blend_position(Vector3 a,Vector3 b,int fraction) {
+    return (Vector3){a.x+(b.x-a.x)*fraction/256,
+                     a.y+(b.y-a.y)*fraction/256,
+                     a.z+(b.z-a.z)*fraction/256};
+}
+static int blend_heading(int a,int b,int fraction) {
+    int delta=((b-a+32768)&65535)-32768;
+    return (a+delta*fraction/256)&65535;
+}
+static void blend_car_rotation(const Car *before,const Car *after,int fraction,int32_t out[9]) {
+    if(!fraction){build_car_rotation(before,out);return;}
+    if(fraction==256){build_car_rotation(after,out);return;}
+    int32_t old[9];
+    build_car_rotation(before,old);build_car_rotation(after,out);
+    for(int i=0;i<9;i++)out[i]=old[i]+(out[i]-old[i])*fraction/256;
+    /* Restore a rigid orthonormal frame after blending. Otherwise the car
+       subtly shrinks/shears between angular samples, especially mid-flip. */
+    int length=int_sqrt(out[0]*out[0]+out[3]*out[3]+out[6]*out[6]);
+    if(!length){build_car_rotation(after,out);return;}
+    for(int row=0;row<3;row++)out[row*3]=out[row*3]*4096/length;
+    int dot=(out[0]*out[1]+out[3]*out[4]+out[6]*out[7])/4096;
+    for(int row=0;row<3;row++)out[row*3+1]-=out[row*3]*dot/4096;
+    length=int_sqrt(out[1]*out[1]+out[4]*out[4]+out[7]*out[7]);
+    if(!length){build_car_rotation(after,out);return;}
+    for(int row=0;row<3;row++)out[row*3+1]=out[row*3+1]*4096/length;
+    out[2]=(out[3]*out[7]-out[6]*out[4])/4096;
+    out[5]=(out[6]*out[1]-out[0]*out[7])/4096;
+    out[8]=(out[0]*out[4]-out[3]*out[1])/4096;
+}
+
 static int landing_angle(int y, int x) {
     if(!x && !y)return 0;
     int best=-2147483647,angle=0;
@@ -257,16 +305,93 @@ static int settle_angle(int angle, int *velocity) {
 /* Camera headings use 8 fractional bits; gameplay headings stay 0..255. */
 static int smooth_camera_heading(int current,int target) {
     int delta=((target*256-current+32768)&65535)-32768;
-    int step=delta/8;
+    int step=delta/10;
     if(!step && delta)step=delta>0?1:-1;
-    if(step>4*256)step=4*256;
-    if(step<-4*256)step=-4*256;
+    if(step>3*256)step=3*256;
+    if(step<-3*256)step=-3*256;
     return (current+step)&65535;
 }
 
+/* Fractional yaw with acceleration and braking toward the car heading. */
+static int chase_turn_velocity;
+static int follow_chase_heading(int current,const Car *car) {
+    int target=(car->yaw*256+car->steer_fraction)&65535;
+    int delta=((target-current+32768)&65535)-32768;
+    if(!delta){chase_turn_velocity=0;return current;}
+    int desired=delta;
+    if(desired>2048)desired=2048;
+    if(desired<-2048)desired=-2048;
+    /* Follow 87.5% of the requested change immediately; retain a light ease. */
+    int acceleration=(desired-chase_turn_velocity)*7/8;
+    if(!acceleration && desired!=chase_turn_velocity)
+        acceleration=desired>chase_turn_velocity?1:-1;
+    chase_turn_velocity+=acceleration;
+    int step=chase_turn_velocity;
+    if(abs(delta)<=4 && abs(step)<=4){chase_turn_velocity=0;return target;}
+    if((delta>0 && step>delta)||(delta<0 && step<delta)) {
+        chase_turn_velocity=0;return target;
+    }
+    return (current+step)&65535;
+}
+
+static void reset_steering(Car *car) {car->steer_velocity=car->steer_fraction=0;}
+static void steer_car(Car *car,int direction,int drifting,int blocked) {
+    if(!direction || blocked){car->steer_velocity=0;return;}
+    int speed=abs(car->speed)+(abs(car->vel.x)+abs(car->vel.z))/2;
+    int rate=car->is_on_ground?768-speed/8:512;
+    if(rate<384)rate=384;
+    if(drifting)rate=1024;
+    /* Half the previous steering speed, retaining fractional turn precision. */
+    int target=direction*(rate*3/16);
+    car->steer_velocity+=(target-car->steer_velocity)/4;
+    car->steer_fraction+=car->steer_velocity;
+    int step=car->steer_fraction/256;
+    car->steer_fraction-=step*256;
+    car->yaw=(car->yaw+step)&255;
+}
+static void grip_car(Car *car,int drifting,int braking) {
+    if(!car->is_on_ground)return;
+    if(!drifting) {
+        Vector3 right=stadium_surface_vector((Vector3){custom_cos_fp[car->yaw&255],0,
+            -custom_sin_fp[car->yaw&255]},car->surface_wall,car->surface_angle);
+        fixed sideways=FP_MUL(car->vel.x,right.x)+FP_MUL(car->vel.y,right.y)+FP_MUL(car->vel.z,right.z);
+        sideways=sideways*3/8;
+        car->vel.x-=FP_MUL(right.x,sideways);
+        car->vel.y-=FP_MUL(right.y,sideways);
+        car->vel.z-=FP_MUL(right.z,sideways);
+    }
+    /* Braking also slows momentum from boost, rather than just drive speed. */
+    if(braking) {
+        car->vel.x=car->vel.x*216/256;car->vel.y=car->vel.y*216/256;
+        car->vel.z=car->vel.z*216/256;
+    }
+}
+
+static int car_needs_recovery(const Car *car) {
+    return car->is_on_ground &&
+        custom_cos_fp[car->visual_pitch&255]*custom_cos_fp[car->visual_roll&255]<128*256;
+}
+static void assist_ground_recovery(Car *car,int held) {
+    if(!held || !car_needs_recovery(car))return;
+    /* Deliberate help, not a snap to upright: reuse the damped landing spring. */
+    car->settle_delay=0;
+    car->visual_pitch=settle_angle(car->visual_pitch,&car->settle_pitch_velocity);
+    car->visual_roll=settle_angle(car->visual_roll,&car->settle_roll_velocity);
+}
+
+static void limit_boost_velocity(Vector3 *velocity,int limit) {
+    int x=velocity->x/16,y=velocity->y/16,z=velocity->z/16;
+    int squared=x*x+y*y+z*z,cap=limit/16;
+    if(squared<=cap*cap)return;
+    int length=int_sqrt(squared)+1;
+    velocity->x=velocity->x*cap/length;
+    velocity->y=velocity->y*cap/length;
+    velocity->z=velocity->z*cap/length;
+}
+
 static void apply_air_rotation(Car *car,int pitch,int roll) {
-    car->visual_pitch=(car->visual_pitch+pitch*9)&255;
-    car->visual_roll=(car->visual_roll+roll*18)&255;
+    car->visual_pitch=(car->visual_pitch+pitch*(roll?3:4))&255;
+    car->visual_roll=(car->visual_roll+roll*(pitch?4:5))&255;
 }
 
 /* Rotate the standing pivot offset as well as the body. Wheel contact stays
@@ -324,7 +449,14 @@ static int camera_yaw = 0;
 
 static int measured_fps = 0;
 static int animation_ticks = 1;
-static int ball_spin_y,ball_spin_x;
+static int ball_spin_y,ball_spin_x; /* Q8 angles retain slow rolling motion. */
+static Car previous_player __attribute__((section(".ewram")));
+static Car previous_opponent __attribute__((section(".ewram")));
+static Ball previous_ball;
+static int previous_camera_yaw;
+static int previous_ball_spin_y,previous_ball_spin_x;
+static int render_fraction=256;
+
 static int score_blue = 0;
 static int score_orange = 0;
 static int match_timer = 120 * 60; // 2 minutes in frames (60 fps)
@@ -357,7 +489,7 @@ static const u8 team_paints[2][3] = { { 3, 5, 7 }, { 6, 1, 4 } };
 static const char *const team_paint_names[2][3] = {
     { "BLUE", "CYAN", "PURPLE" }, { "ORANGE", "RED", "GOLD" }
 };
-static int pause_selection = 0;    // 0=Resume, 1=Exit to Menu
+static int pause_selection = 0;    // 0=Resume, 1=Restart match, 2=Exit to Menu
 
 /* --- Particles --- */
 typedef struct {
@@ -899,7 +1031,11 @@ void draw_particles(void) {
     for(int i=0;i<MAX_PARTICLES;i++) {
         if(particles[i].life>0) {
             int sx, sy;
-            if (project_vertex_world(particles[i].pos, &sx, &sy)) {
+            Vector3 position=particles[i].pos;
+            position.x-=particles[i].vel.x*(256-render_fraction)/256;
+            position.y-=particles[i].vel.y*(256-render_fraction)/256;
+            position.z-=particles[i].vel.z*(256-render_fraction)/256;
+            if (project_vertex_world(position, &sx, &sy)) {
                 draw_point(sx, sy, particles[i].color);
                 if ((particles[i].flags & PARTICLE_CONFETTI) &&
                     particles[i].life > 42 && (i & 1) == 0) {
@@ -996,7 +1132,7 @@ void reset_kickoff(void) {
     player.pos.y = 0;
     player.pos.z = -250 * FP_SCALE;
     player.vel.x = player.vel.y = player.vel.z = 0;
-    player.yaw = 0;
+    player.yaw = 0; reset_steering(&player);
     player.speed = 0;
     player.boost = 34 * FP_SCALE; // Kickoff boost
     player.is_on_ground = 1;
@@ -1007,14 +1143,14 @@ void reset_kickoff(void) {
     player.visual_pitch = 0;
     player.visual_roll = 0;
     player.flip_timer = player.boost_requested = 0;
-    camera_yaw = link_match && link_player_id()==1 ? 128*256 : 0;  // Local kickoff heading
+    camera_yaw = link_match && link_player_id()==1 ? 128*256 : 0;chase_turn_velocity=0;  // Local kickoff heading
 
     // Reset Opponent (Orange team) at north kickoff spot facing South (yaw = 128)
     opponent.pos.x = 0;
     opponent.pos.y = 0;
     opponent.pos.z = 250 * FP_SCALE;
     opponent.vel.x = opponent.vel.y = opponent.vel.z = 0;
-    opponent.yaw = 128;
+    opponent.yaw = 128; reset_steering(&opponent);
     opponent.speed = 0;
     opponent.boost = 34 * FP_SCALE;
     opponent.is_on_ground = 1;
@@ -1070,7 +1206,7 @@ static void setup_tutorial_stage(void) {
 
     player.pos = stage->car_start_pos;
     player.vel.x = player.vel.y = player.vel.z = 0;
-    player.yaw = stage->car_start_yaw;
+    player.yaw = stage->car_start_yaw; reset_steering(&player);
     player.speed = 0;
     player.boost = 100 * FP_SCALE;
     player.is_on_ground = 1;
@@ -1087,7 +1223,7 @@ static void setup_tutorial_stage(void) {
     ball.vel.y = 0;
     /* Stationary ball ahead of the car makes the first shot easy to line up. */
     ball.vel.z = 0;
-    camera_yaw = player.yaw*256;
+    camera_yaw = player.yaw*256;chase_turn_velocity=0;
 
     player.boost_requested = 0;
     cam_mode = 0;
@@ -1183,7 +1319,8 @@ static void apply_player_boost(void) {
             fixed Fy = rotation[5] >> 4;
             fixed Fz = rotation[8] >> 4;
 
-            fixed boost_accel = (FP_SCALE * 1848) / 1000; // 10% quicker aerial boost
+            int fuel_spent=player.boost<310?player.boost:310;
+            fixed boost_accel = ((FP_SCALE * 1848) / 1000)*fuel_spent/310; // 10% quicker aerial boost
             fixed push_x = FP_MUL(Fx, boost_accel);
             fixed push_y = FP_MUL(Fy, boost_accel);
             fixed push_z = FP_MUL(Fz, boost_accel);
@@ -1197,19 +1334,13 @@ static void apply_player_boost(void) {
                 player.vel.y += push_y;
                 player.vel.z += push_z;
 
-                fixed max_vel = (198 * FP_SCALE) / 10;
-                if (player.vel.x >  max_vel) player.vel.x =  max_vel;
-                if (player.vel.x < -max_vel) player.vel.x = -max_vel;
-                if (player.vel.y >  max_vel) player.vel.y =  max_vel;
-                if (player.vel.y < -max_vel) player.vel.y = -max_vel;
-                if (player.vel.z >  max_vel) player.vel.z =  max_vel;
-                if (player.vel.z < -max_vel) player.vel.z = -max_vel;
+                limit_boost_velocity(&player.vel,(198*FP_SCALE)/10);
             } else {
-                player.speed += (BOOST_ACCEL * 11) / 10;
+                player.speed += ((BOOST_ACCEL * 11) / 10)*fuel_spent/310;
                 if (player.speed > MAX_DRIVE_SPEED * 18 / 10)
                     player.speed = MAX_DRIVE_SPEED * 18 / 10;
             }
-            player.boost -= 310;
+            player.boost -= fuel_spent;
             if (player.boost < 0) player.boost = 0;
             /* Transform a rear exhaust point with the centered body transform. */
             Vector3 exhaust = surface_car_position(garage_model[player.team==6], &player, rotation);
@@ -1272,7 +1403,7 @@ void update_car_physics(Car *car, int is_player) {
         if (car->flip_roll_dir == 1) { ax -= (c_right_x * 3) / 4; az -= (c_right_z * 3) / 4; }
         else if (car->flip_roll_dir == -1) { ax += (c_right_x * 3) / 4; az += (c_right_z * 3) / 4; }
         
-        /* Keep the original total push with a quicker flip; diagonals have
+        /* Keep the original total push with a slower flip; diagonals have
            the same strength as a straight dodge, not sqrt(2) times more. */
         if (car->flip_pitch_dir && car->flip_roll_dir) {
             ax = (ax * 181) / 256;
@@ -1496,9 +1627,9 @@ int check_car_ball_collision(Car *car) {
     fixed dz = ball.pos.z - car->pos.z;
 
     // Shift to avoid overflow on standard GBA 32-bit registers
-    fixed dx_s = dx >> 4;
-    fixed dy_s = dy >> 4;
-    fixed dz_s = dz >> 4;
+    fixed dx_s = dx / 16;
+    fixed dy_s = dy / 16;
+    fixed dz_s = dz / 16;
 
     int32_t dist_sq_s = (dx_s * dx_s + dy_s * dy_s + dz_s * dz_s);
     int32_t min_coll = CAR_RADIUS + (is_hockey_match?PUCK_RADIUS:BALL_RADIUS);
@@ -1508,11 +1639,10 @@ int check_car_ball_collision(Car *car) {
         int32_t dist_s = collision_sqrt(dist_sq_s);
         if (dist_s == 0) dist_s = 1;
 
-        // Calculate collision normals (8.8 format) using division LUT
-        fixed inv_d = (dist_s < 2048) ? custom_div_lut[dist_s] : ((1 << 16) / dist_s);
-        fixed nx = (dx_s * inv_d) >> 8;
-        fixed ny = (dy_s * inv_d) >> 8;
-        fixed nz = (dz_s * inv_d) >> 8;
+        /* Symmetric division avoids stronger hits in negative directions. */
+        fixed nx=dx_s*256/dist_s;
+        fixed ny=dy_s*256/dist_s;
+        fixed nz=dz_s*256/dist_s;
 
         /* Coincident centers need a defined contact normal as well. */
         if (!dx_s && !dy_s && !dz_s) {
@@ -1520,9 +1650,14 @@ int check_car_ball_collision(Car *car) {
         }
 
         // Push ball out of car penetration volume
-        ball.pos.x = car->pos.x + FP_MUL(nx, min_coll);
-        ball.pos.y = car->pos.y + FP_MUL(ny, min_coll);
-        ball.pos.z = car->pos.z + FP_MUL(nz, min_coll);
+        ball.pos.x = car->pos.x + nx*min_coll/256;
+        ball.pos.y = car->pos.y + ny*min_coll/256;
+        ball.pos.z = car->pos.z + nz*min_coll/256;
+
+        /* A car above the ball must not push its centre through the floor. */
+        fixed half_height=is_hockey_match?PUCK_HALF_HEIGHT:BALL_RADIUS;
+        if(ball.pos.y<half_height)ball.pos.y=half_height;
+        if(ball.pos.y>STADIUM_HEIGHT-half_height)ball.pos.y=STADIUM_HEIGHT-half_height;
 
         // Convert car driving speed & velocity to world space vector
         Vector3 direction=stadium_surface_vector((Vector3){custom_sin_fp[car->yaw&255],0,
@@ -1546,16 +1681,16 @@ int check_car_ball_collision(Car *car) {
                0.35. Tangential velocity is untouched, so grazing contacts
                redirect the ball without inventing extra forward energy. */
             fixed impulse = (-vel_along_norm * 6) / 5;
-            ball.vel.x += FP_MUL(impulse, nx);
-            ball.vel.y += FP_MUL(impulse, ny);
-            ball.vel.z += FP_MUL(impulse, nz);
+            ball.vel.x += impulse*nx/256;
+            ball.vel.y += impulse*ny/256;
+            ball.vel.z += impulse*nz/256;
 
             /* Equal/opposite reaction scaled by the heavier car's mass.
                No fixed kickback or speed penalty on a feather-light touch. */
             fixed reaction=impulse/8;
-            car->vel.x -= FP_MUL(reaction,nx);
-            car->vel.y -= FP_MUL(reaction,ny);
-            car->vel.z -= FP_MUL(reaction,nz);
+            car->vel.x -= reaction*nx/256;
+            car->vel.y -= reaction*ny/256;
+            car->vel.z -= reaction*nz/256;
 
             /* Cap total speed, not individual axes; diagonal hits must not
                gain a sqrt(3) advantage. Apply after the complete impulse. */
@@ -1580,22 +1715,24 @@ void check_car_car_collision(Car *c1, Car *c2) {
     fixed dy = c2->pos.y - c1->pos.y;
     fixed dz = c2->pos.z - c1->pos.z;
 
-    fixed dx_s = dx >> 4;
-    fixed dy_s = dy >> 4;
-    fixed dz_s = dz >> 4;
+    fixed dx_s = dx / 16;
+    fixed dy_s = dy / 16;
+    fixed dz_s = dz / 16;
 
     int32_t dist_sq_s = (dx_s * dx_s + dy_s * dy_s + dz_s * dz_s);
     int32_t min_coll   = 26 * FP_SCALE;
     int32_t min_coll_sq_s = (min_coll >> 4) * (min_coll >> 4);
 
     if (dist_sq_s < min_coll_sq_s) {
-        int32_t dist_s = fast_sqrt(dist_sq_s);
+        int32_t dist_s = collision_sqrt(dist_sq_s);
         if (dist_s == 0) dist_s = 1;
 
-        fixed inv_d = (dist_s < 2048) ? custom_div_lut[dist_s] : ((1 << 16) / dist_s);
-        fixed nx = (dx_s * inv_d) >> 8;
-        fixed ny = (dy_s * inv_d) >> 8;
-        fixed nz = (dz_s * inv_d) >> 8;
+        fixed nx=dx_s*256/dist_s;
+        fixed ny=dy_s*256/dist_s;
+        fixed nz=dz_s*256/dist_s;
+
+        /* Coincident centers otherwise produce a zero normal and stay stuck. */
+        if(!dx_s && !dy_s && !dz_s){nx=256;ny=0;nz=0;}
 
         fixed overlap = min_coll - (dist_s << 4);
 
@@ -1633,38 +1770,16 @@ void check_car_car_collision(Car *c1, Car *c2) {
         fixed vel_along_norm = (rvx * nx + rvy * ny + rvz * nz) >> 8;
 
         if (vel_along_norm < 0) {
-            /* Base impulse from relative velocity (restitution 0.75) */
-            fixed impulse = -(75 * vel_along_norm) / 100;
+            /* Equal masses, restitution 0.35: one balanced normal impulse.
+               Preserve tangential motion and avoid order-dependent ram bonuses. */
+            fixed impulse=(-vel_along_norm*135)/200;
+            fixed imp_x=impulse*nx/256;
+            fixed imp_y=impulse*ny/256;
+            fixed imp_z=impulse*nz/256;
+            c1->vel.x-=imp_x;c1->vel.y-=imp_y;c1->vel.z-=imp_z;
+            c2->vel.x+=imp_x;c2->vel.y+=imp_y;c2->vel.z+=imp_z;
+            audio_impact(-vel_along_norm);
 
-            /* Ram bonus: c1's forward speed along the normal adds extra
-               push — the faster you hit, the harder the opponent flies  */
-            fixed c1_ram = (c1_wx * nx + c1_wy * ny + c1_wz * nz) >> 8;
-            if (c1_ram > 0) {
-                impulse += (c1_ram * 55) / 100;
-            }
-
-            fixed imp_x = FP_MUL(impulse, nx);
-            fixed imp_y = FP_MUL(impulse, ny);
-            fixed imp_z = FP_MUL(impulse, nz);
-
-            /* Rammer barely recoils; victim takes most of the impulse */
-            c1->vel.x -= (imp_x * 30) >> 8;  /* ~12% recoil to rammer */
-            c1->vel.y -= (imp_y * 30) >> 8;
-            c1->vel.z -= (imp_z * 30) >> 8;
-            c2->vel.x += (imp_x * 210) >> 8; /* ~82% push to victim   */
-            c2->vel.y += (imp_y * 210) >> 8;
-            c2->vel.z += (imp_z * 210) >> 8;
-
-            /* Speed reduction: rammer keeps most speed, victim brakes */
-            fixed s1 = abs(c1->speed);
-            fixed s2 = abs(c2->speed);
-            if (s1 > s2) {
-                c1->speed = (c1->speed * 240) >> 8; /* rammer ~94% */
-                c2->speed = (c2->speed * 210) >> 8; /* victim  ~82% */
-            } else {
-                c2->speed = (c2->speed * 240) >> 8;
-                c1->speed = (c1->speed * 210) >> 8;
-            }
         }
     }
 }
@@ -1855,7 +1970,18 @@ static void draw_hud_box(int x, int y, int width, int height, u8 fill, u8 edge) 
 
 static void draw_ball_indicator(void) {
     int x,y;
-    if (!world_target_indicator(ball.pos,&x,&y)) return;
+    if (!world_target_indicator(ball.pos,&x,&y)) {
+        int dx=(ball.pos.x-player.pos.x)/256,dz=(ball.pos.z-player.pos.z)/256;
+        if(dx*dx+dz*dz>200*200 && project_vertex_world(ball.pos,&x,&y) &&
+           x>12 && x<228 && y>28 && y<132) {
+            /* Four small corner marks keep a distant ball easy to follow. */
+            for(int side=-1;side<=1;side+=2)for(int up=-1;up<=1;up+=2) {
+                draw_line(x+side*8,y+up*8,x+side*5,y+up*8,131);
+                draw_line(x+side*8,y+up*8,x+side*8,y+up*5,131);
+            }
+        }
+        return;
+    }
     int dx=x-120,dy=y-72;
     int length=abs(dx)>abs(dy)?abs(dx):abs(dy);
     if(!length) return;
@@ -1876,15 +2002,24 @@ static void draw_match_hud(void) {
     draw_ball_indicator();
     fast_draw_team_score("FPS",measured_fps,4,20,130);
     /* Transparent text with a one-pixel shadow keeps the arena visible. */
-    fast_draw_team_score("BLU", score_blue, 40, 4, 146);
-    fast_draw_time(match_timer / 60, 100, 4, 130);
-    fast_draw_team_score("ORA", score_orange, 152, 4, 131);
+    fast_draw_team_score("BLU", score_blue, 40, 4, 130);
+    fast_draw_time(match_timer / 60, 100, 4, match_timer<=10*60?28:match_timer<=30*60?131:130);
+    fast_draw_team_score("ORA", score_orange, 152, 4, 130);
     draw_line(40,15,87,15,146);draw_line(152,15,199,15,131);
 
     if(performance_mode!=2)fast_draw_speed(FP_TO_INT(abs(player.speed) * 35), 62, 147, 130);
     fast_draw_boost(boost_pct, 212, 136);
 
-    if(performance_mode==2)return;
+    if(performance_mode==2) {
+        if(game_state!=STATE_REPLAY) {
+            if(car_needs_recovery(&player))
+                draw_hud_text(control_scheme?"SEL:RECOVER":"R: RECOVER",4,138,131);
+            else if(!player.is_on_ground)
+                draw_hud_text(player.can_double_jump?"A: FLIP":control_scheme?"AIR CONTROL":"R: AIR",4,138,130);
+        }
+        draw_hud_text(game_state==STATE_REPLAY?"REPLAY":cam_mode?"CAM:BALL":"CAM:CHASE",4,150,130);
+        return;
+    }
     if (game_state == STATE_REPLAY) {
         draw_hud_text("REPLAY", 62, 134, 131);
     } else if (cam_mode == 0) {
@@ -2219,7 +2354,7 @@ static void handle_player_input(void) {
         btn_right = drive_down(KEY_RIGHT);
         btn_jump = drive_hit(KEY_A);
         btn_boost = drive_down(KEY_B);
-        btn_drift = drive_down(KEY_L);
+        btn_drift = drive_down(KEY_R);
         btn_aerial_mod = drive_down(KEY_R);
     } else { // Alternative
         btn_accel = drive_down(KEY_R);
@@ -2239,26 +2374,22 @@ static void handle_player_input(void) {
 
     // Steering + Drift
     int is_drifting = btn_drift && player.is_on_ground && (player.speed > FP_SCALE || player.speed < -FP_SCALE);
-    int turn_rate = player.is_on_ground ? 4 : 3;
-    if (is_drifting) turn_rate = 10;
-    
     int block_yaw = player.flip_timer > 0 ||
         (!player.is_on_ground && (btn_aerial_mod || btn_jump));
-
-    if (!block_yaw) {
-        if (btn_left)  player.yaw = (player.yaw - turn_rate) & 255;
-        if (btn_right) player.yaw = (player.yaw + turn_rate) & 255;
-    }
+    steer_car(&player,btn_right-btn_left,is_drifting,block_yaw);
+    grip_car(&player,is_drifting,btn_reverse);
+    assist_ground_recovery(&player,btn_drift);
+    if(btn_reverse)btn_accel=0;
 
     if (is_drifting && (btn_left || btn_right)) {
         Vector3 right=stadium_surface_vector((Vector3){custom_cos_fp[player.yaw&255],0,
             -custom_sin_fp[player.yaw&255]},player.surface_wall,player.surface_angle);
         fixed right_x=right.x, right_z=right.z;
-        fixed slide = (player.speed * 35) / 100;
+        fixed slide = (player.speed * 12) / 100;
         player.vel.y += FP_MUL(right.y, slide);
         player.vel.x += FP_MUL(right_x, slide);
         player.vel.z += FP_MUL(right_z, slide);
-        player.speed = (player.speed * 220) >> 8;
+        player.speed = (player.speed * 240) >> 8;
         
         if (state_timer % 2 == 0) {
             Vector3 skid_pos1 = player.pos;
@@ -2282,6 +2413,7 @@ static void handle_player_input(void) {
         } else if (btn_reverse) {
             if (player.speed > 0) {
                 player.speed -= ACCEL_RATE * 2;
+                if(player.speed<0)player.speed=0;
             } else {
                 player.speed -= ACCEL_RATE;
             }
@@ -2289,12 +2421,12 @@ static void handle_player_input(void) {
         }
     }
 
-    /* Chase and ball cameras share a bounded shortest-path turn. */
-    camera_yaw=smooth_camera_heading(camera_yaw,player.yaw);
+    /* Accelerate into the turn and brake smoothly toward the car heading. */
+    camera_yaw=follow_chase_heading(camera_yaw,&player);
 
     /* Camera cycle is handled globally in the game loop via KEY_L hit */
 
-    // Faster arrow-controlled pitch/roll while the aerial modifier is held.
+    // Balanced diagonal aerial input while the modifier is held.
     if (btn_aerial_mod && !player.is_on_ground && player.flip_timer == 0 && !btn_jump) {
         int pitch=(drive_down(KEY_UP)?1:0)-(drive_down(KEY_DOWN)?1:0);
         int roll=(drive_down(KEY_LEFT)?1:0)-(drive_down(KEY_RIGHT)?1:0);
@@ -2345,13 +2477,13 @@ static void handle_player_input(void) {
 static void update_link_car(int side) {
     Car temp;
     if(side){temp=player;player=opponent;opponent=temp;}
-    int saved_camera=camera_yaw,saved_scheme=control_scheme;
+    int saved_camera=camera_yaw,saved_turn=chase_turn_velocity,saved_scheme=control_scheme;
     control_override=1;control_scheme=0;
     control_down=link_buttons[side];control_hits=control_down&~link_previous[side];
     handle_player_input();
     update_car_physics(&player,1);
     control_override=0;control_scheme=saved_scheme;
-    if(side!=link_player_id())camera_yaw=saved_camera;
+    if(side!=link_player_id()){camera_yaw=saved_camera;chase_turn_velocity=saved_turn;}
     if(side){temp=player;player=opponent;opponent=temp;}
 }
 
@@ -2361,7 +2493,7 @@ static u16 link_local_buttons(void) {
         const Car *local=link_player_id()?&opponent:&player;
         keys&=~(KEY_R|KEY_L|KEY_SELECT|KEY_UP);
         if((local->is_on_ground && key_is_down(KEY_R)) || key_is_down(KEY_UP))keys|=KEY_UP;
-        if(key_is_down(KEY_SELECT))keys|=KEY_L;
+        if(local->is_on_ground && key_is_down(KEY_SELECT))keys|=KEY_R;
         if(!local->is_on_ground)keys|=KEY_R;
     }
     return keys;
@@ -2429,15 +2561,36 @@ int main(void) {
                 link_waiting=!network_step;
             }
         }
-        int simulation_steps=dt_time_frames;
-        if(simulation_steps<1)simulation_steps=1;
+        int real_ticks=dt_time_frames;
+        int slowed_state=game_state==STATE_PLAY || game_state==STATE_TRAINING ||
+            game_state==STATE_TUTORIAL || game_state==STATE_GOAL ||
+            game_state==STATE_TRAINING_GOAL || game_state==STATE_REPLAY;
+        static unsigned speed_phase=0;
+        int simulation_steps=real_ticks;
+        if(slowed_state && network_step) {
+            /* Exactly one simulation tick per two refreshes: half original speed. */
+            simulation_steps=scaled_simulation_steps(real_ticks,&speed_phase);
+        } else if(!slowed_state) speed_phase=0;
         if(simulation_steps>4)simulation_steps=4;
-        animation_ticks=simulation_steps;
-        u16 first_key_previous=__key_prev;
+        animation_ticks=real_ticks;
+        u16 first_key_previous=__key_prev,polled_keys=__key_curr;
+        static u16 pending_keys=0;
+        pending_keys|=__key_curr & ~__key_prev;
+        if(simulation_steps) {
+            __key_curr|=pending_keys;
+            __key_prev=__key_curr & ~pending_keys;
+            pending_keys=0;
+        }
         for(int simulation_step=0;simulation_step<simulation_steps;simulation_step++) {
         /* Held controls apply every tick; presses apply only on the first. */
-        if(simulation_step)__key_prev=__key_curr;
-        dt_time_frames=1;
+        if(simulation_step){__key_curr=polled_keys;__key_prev=polled_keys;}
+        dt_time_frames=(simulation_step+1)*real_ticks/simulation_steps-
+                       simulation_step*real_ticks/simulation_steps;
+        if(network_step) {
+            previous_player=player;previous_opponent=opponent;previous_ball=ball;
+            previous_camera_yaw=camera_yaw;
+            previous_ball_spin_y=ball_spin_y;previous_ball_spin_x=ball_spin_x;
+        }
         stadium_light_phase=(stadium_light_phase+1)&255;
         // 1. STATE MACHINE UPDATES
         if(game_state<=STATE_MENU_LINK) {
@@ -2524,7 +2677,7 @@ int main(void) {
                         enable_opponent=1;link_match=1;
                         link_buttons[0]=link_buttons[1]=link_previous[0]=link_previous[1]=0;
                         srand(1);reset_match();
-                        camera_yaw=link_player_id()?128*256:0;
+                        camera_yaw=link_player_id()?128*256:0;chase_turn_velocity=0;
                     }
                 }
                 break;
@@ -2687,6 +2840,13 @@ int main(void) {
                         ? STATE_MENU_TRAINING : STATE_TITLE;
                     break;
                 }
+                if(game_state==STATE_TRAINING && key_is_down(KEY_SELECT)) {
+                    if(key_hit(KEY_A) || key_hit(KEY_B)) {
+                        if(key_hit(KEY_B))current_training_level=(current_training_level+1)%NUM_TRAINING_LEVELS;
+                        game_state=STATE_TRAINING_INIT;
+                        break;
+                    }
+                }
                 if (game_state == STATE_TUTORIAL) {
                     if (key_hit(KEY_SELECT)) { setup_tutorial_stage(); break; }
                     if (tutorial_flash_timer > 0) {
@@ -2780,8 +2940,14 @@ int main(void) {
                 break;
 
             case STATE_TRAINING_INIT:
+                /* A retry must also clear an unfinished dodge and old effects. */
+                player.flip_timer=player.flip_pitch_dir=player.flip_roll_dir=0;
+                player.flip_base_pitch=player.flip_base_roll=0;
+                player.boost_requested=0;
+                screen_shake=camera_shake_x=camera_shake_y=0;
+                touch_cooldown=0;
                 player.pos = training_levels[current_training_level].car_start_pos;
-                player.yaw = training_levels[current_training_level].car_start_yaw;
+                player.yaw = training_levels[current_training_level].car_start_yaw; reset_steering(&player);
                 player.vel.x = 0; player.vel.y = 0; player.vel.z = 0;
                 player.speed = 0;
                 player.boost = 34 * FP_SCALE;
@@ -2799,7 +2965,7 @@ int main(void) {
                 training_timer = 0;
                 training_touches = 0;
                 training_post_touch_timer = 0;
-                camera_yaw = player.yaw*256;
+                camera_yaw = player.yaw*256;chase_turn_velocity=0;
                 game_state = STATE_TRAINING;
                 break;
 
@@ -2862,7 +3028,7 @@ int main(void) {
 
             case STATE_PAUSED:
                 if (key_hit(KEY_UP) && pause_selection > 0) pause_selection--;
-                if (key_hit(KEY_DOWN) && pause_selection < 1) pause_selection++;
+                if (key_hit(KEY_DOWN) && pause_selection < 2) pause_selection++;
                 /* Resume: START, or A on "RESUME" */
                 if (key_hit(KEY_START) || (key_hit(KEY_B))) {
                     game_state = STATE_PLAY;
@@ -2870,6 +3036,8 @@ int main(void) {
                 if (key_hit(KEY_A)) {
                     if (pause_selection == 0) {
                         game_state = STATE_PLAY;
+                    } else if(pause_selection==1) {
+                        reset_match();
                     } else {
                         game_state = STATE_TITLE;
                         menu_selection = 0;
@@ -2923,11 +3091,34 @@ int main(void) {
         if(link_match && network_step){link_previous[0]=link_buttons[0];link_previous[1]=link_buttons[1];}
         if(network_step && game_state>STATE_MENU_LINK && game_state!=STATE_PAUSED) {
             update_particles();
-            ball_spin_y=(ball_spin_y+(ball.vel.x>>7))&255;
-            ball_spin_x=(ball_spin_x+(ball.vel.z>>7))&255;
+            ball_spin_y=(ball_spin_y+ball.vel.x*2)&65535;
+            ball_spin_x=(ball_spin_x+ball.vel.z*2)&65535;
+        }
+        if(game_state!=achievement_previous_state) {
+            previous_player=player;previous_opponent=opponent;previous_ball=ball;
+            previous_camera_yaw=camera_yaw;
+            previous_ball_spin_y=ball_spin_y;previous_ball_spin_x=ball_spin_x;
         }
         } /* fixed simulation ticks */
-        __key_prev=first_key_previous;
+        __key_curr=polled_keys;__key_prev=first_key_previous;
+        /* Physics and presentation share the 30 Hz cadence. Show this tick,
+           not the previous pose: delaying it adds a full frame of input lag. */
+        Car live_player=player,live_opponent=opponent;
+        Ball live_ball=ball;
+        int live_camera_yaw=camera_yaw;
+        int live_spin_y=ball_spin_y,live_spin_x=ball_spin_x;
+        render_fraction=256;
+        if(abs(player.pos.x-previous_player.pos.x)>128*256 ||
+           abs(player.pos.z-previous_player.pos.z)>128*256)render_fraction=256;
+        int32_t player_render_rotation[9],opponent_render_rotation[9];
+        blend_car_rotation(&previous_player,&player,render_fraction,player_render_rotation);
+        blend_car_rotation(&previous_opponent,&opponent,render_fraction,opponent_render_rotation);
+        player.pos=blend_position(previous_player.pos,player.pos,render_fraction);
+        opponent.pos=blend_position(previous_opponent.pos,opponent.pos,render_fraction);
+        ball.pos=blend_position(previous_ball.pos,ball.pos,render_fraction);
+        camera_yaw=blend_heading(previous_camera_yaw,camera_yaw,render_fraction);
+        ball_spin_y=blend_heading(previous_ball_spin_y,ball_spin_y,render_fraction);
+        ball_spin_x=blend_heading(previous_ball_spin_x,ball_spin_x,render_fraction);
         /* Simulation always runs blue then orange. Only the presentation swaps
            on console 2, so collisions and pad pickups have identical ordering. */
         int swapped_view=link_match && link_player_id()==1;
@@ -3033,7 +3224,7 @@ int main(void) {
             memcpy32(frame_buffer, coverart_data, 38400 / 4);
             
             // Flashing "PRESS START TO PLAY"
-            if ((current_video_tick / 30) & 1) { 
+            if ((current_video_tick / 30) & 1) {
                 draw_string("PRESS START TO PLAY", 50, 140, 130);
             }
         } else if (game_state == STATE_TITLE || (game_state >= STATE_MENU_PLAY && game_state <= STATE_MENU_LINK)) {
@@ -3260,20 +3451,20 @@ int main(void) {
                 if (!world_sphere_visible(object_pos, (items[i].id==2 ? 16 : 48)*FP_SCALE)) continue;
                 if (items[i].id == 0) {
                     int32_t mod_m[9];
-                    build_car_rotation(&player, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[player.team==6], items[i].dist), surface_car_position(garage_model[player.team==6], &player, mod_m), mod_m, FP_ONE, team_paints[player.team==6][garage_paint[player.team==6]], performance_mode?RENDER_FLAT:RENDER_TEXTURED);
+                    memcpy(mod_m,swapped_view?opponent_render_rotation:player_render_rotation,sizeof(mod_m));
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[player.team==6], items[i].dist), surface_car_position(garage_model[player.team==6], &player, mod_m), mod_m, FP_ONE, team_paints[player.team==6][garage_paint[player.team==6]], performance_mode?RENDER_ACCENTS:RENDER_TEXTURED);
                 } else if (items[i].id == 1 && enable_opponent &&
                            game_state != STATE_TRAINING && game_state != STATE_TUTORIAL) {
                     int32_t mod_m[9];
-                    build_car_rotation(&opponent, mod_m);
-                    draw_model_world_mat(car_gameplay_mesh(garage_model[opponent.team==6], items[i].dist), surface_car_position(garage_model[opponent.team==6], &opponent, mod_m), mod_m, FP_ONE, team_paints[opponent.team==6][garage_paint[opponent.team==6]], performance_mode?RENDER_FLAT:RENDER_TEXTURED);
+                    memcpy(mod_m,swapped_view?player_render_rotation:opponent_render_rotation,sizeof(mod_m));
+                    draw_model_world_mat(car_gameplay_mesh(garage_model[opponent.team==6], items[i].dist), surface_car_position(garage_model[opponent.team==6], &opponent, mod_m), mod_m, FP_ONE, team_paints[opponent.team==6][garage_paint[opponent.team==6]], performance_mode==2?RENDER_FLAT:performance_mode?RENDER_ACCENTS:RENDER_TEXTURED);
                 } else if (items[i].id == 2) {
                     if (is_hockey_match) {
                         /* Dark rubber puck contrasts with the ice. */
-                        draw_model_world(&puck_mesh, ball.pos, ball_spin_y, 0, 0, FP_SCALE, 149, RENDER_FLAT);
+                        draw_model_world(&puck_mesh, ball.pos, ball_spin_y>>8, 0, 0, FP_SCALE, 149, RENDER_FLAT);
                     } else {
-                        if (!draw_soccer_ball(ball.pos, ball_spin_y, ball_spin_x))
-                            draw_model_world(ball_gameplay_mesh(items[i].dist), ball.pos, ball_spin_y, ball_spin_x, 0,
+                        if (!draw_soccer_ball(ball.pos, ball_spin_y>>8, ball_spin_x>>8))
+                            draw_model_world(ball_gameplay_mesh(items[i].dist), ball.pos, ball_spin_y>>8, ball_spin_x>>8, 0,
                                              FP_SCALE / 3 * 2, 130, RENDER_FLAT);
                     }
                 }
@@ -3283,7 +3474,7 @@ int main(void) {
             draw_particles();
             
             // Draw Minimap Radar (big when SELECT held)
-            if (key_is_down(KEY_SELECT) && game_state != STATE_PAUSED && game_state != STATE_TUTORIAL) {
+            if (key_is_down(KEY_SELECT) && !(control_scheme && abs(player.speed)>FP_SCALE) && game_state != STATE_PAUSED && game_state != STATE_TUTORIAL && game_state != STATE_TRAINING) {
                 draw_big_radar();
             } else if (game_state!=STATE_TUTORIAL && game_state!=STATE_TUTORIAL_BRIEFING && game_state!=STATE_TUTORIAL_COMPLETE) {
                 if(performance_mode!=2)draw_radar();
@@ -3368,6 +3559,7 @@ int main(void) {
                 char tm_str[16];
                 snprintf(tm_str, sizeof(tm_str), "%02d SEC", time_left);
                 draw_string(tm_str, 200, 2, 131);
+                draw_hud_text("SEL+A:RETRY  SEL+B:NEXT",4,28,130);
             }
             if (game_state == STATE_TRAINING_GOAL) {
                 draw_string("GREAT SHOT!", 76, 60, 131);
@@ -3401,14 +3593,15 @@ int main(void) {
 
             /* ==== PAUSE OVERLAY ==== */
             if (game_state == STATE_PAUSED) {
-                draw_hud_box(44, 47, 152, 67, 5, 10);
+                draw_hud_box(44, 39, 152, 88, 5, 10);
                 /* Title */
-                draw_string("- PAUSED -", 80, 54, 131);
+                draw_string("- PAUSED -", 80, 46, 131);
                 /* Options */
-                draw_menu_text_box("RESUME", 70, pause_selection == 0 ? 131 : 130, 136);
-                draw_menu_text_box("EXIT MENU", 86, pause_selection == 1 ? 131 : 130, 136);
+                draw_menu_text_box("RESUME", 64, pause_selection == 0 ? 131 : 130, 136);
+                draw_menu_text_box("RESTART MATCH", 80, pause_selection == 1 ? 131 : 130, 136);
+                draw_menu_text_box("EXIT MENU", 96, pause_selection == 2 ? 131 : 130, 136);
                 /* Controls hint */
-                draw_string("A:SEL  B:RESUME", 64, 104, 130);
+                draw_string("A:SEL  B:RESUME", 64, 116, 130);
             }
 
         }
@@ -3426,6 +3619,8 @@ int main(void) {
             }
         }
         if(swapped_view){Car tmp=player;player=opponent;opponent=tmp;}
+        player=live_player;opponent=live_opponent;ball=live_ball;
+        camera_yaw=live_camera_yaw;ball_spin_y=live_spin_y;ball_spin_x=live_spin_x;
         // 4. SWAP AND SYNC
         swap_buffers();
     }
